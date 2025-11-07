@@ -1,0 +1,34 @@
+# PostgreSQL Password File (.pgpass)
+#
+# Format: hostname:port:database:username:password
+#
+# This file stores PostgreSQL credentials securely.
+# The adapter uses this file to authenticate database connections for CDC polling.
+#
+# Setup Instructions:
+# 1. Copy this file to your home directory: cp .pgpass.example ~/.pgpass
+# 2. Edit with your actual credentials: nano ~/.pgpass
+# 3. Set secure permissions: chmod 600 ~/.pgpass
+#
+# IMPORTANT:
+# - File MUST have permissions 600 (owner read/write only)
+# - PostgreSQL will refuse to use the file if permissions are too open
+# - Never commit ~/.pgpass to version control
+# - One entry per line
+#
+# Examples:
+
+# Local PostgreSQL (most common)
+localhost:5432:neotree:postgres:your_password_here
+
+# Remote PostgreSQL server
+# remote-db.example.com:5432:neotree:neotree_user:your_password_here
+
+# Multiple databases on same host (use wildcards)
+# localhost:5432:*:postgres:your_password_here
+
+# Multiple hosts with same credentials
+# *.example.com:5432:neotree:postgres:your_password_here
+
+# Any host, any database (use with caution!)
+# *:*:*:postgres:your_password_here
