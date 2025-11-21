@@ -21,7 +21,7 @@ class FHIRAdapterAPI {
   private cdcService: CDCService;
   private openhimClient: OpenHIMClient;
   private config = getConfig();
-  private port = parseInt(process.env.ADAPTER_PORT || '3001', 10);
+  private port = parseInt(process.env.ADAPTER_PORT || '3002', 10);
 
   constructor() {
     this.app = express();
