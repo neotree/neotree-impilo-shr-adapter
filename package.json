@@ -6,7 +6,7 @@
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
-    "start": "ts-node src/fhir-adapter/index.ts",
+    "start": "node dist/fhir-adapter/index.js",
     "dev": "ts-node src/fhir-adapter/index.ts",
     "test": "jest",
     "test:auth": "ts-node scripts/test-openhim-auth.ts",
