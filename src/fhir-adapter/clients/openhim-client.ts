@@ -60,27 +60,6 @@ export class OpenHIMClient {
       'auth-salt': '',
       'auth-token': '',
     };
-
-    // NOTE: If your OpenHIM instance uses custom token-based auth, uncomment below:
-    // const timestamp = new Date().toISOString();
-    // const salt = crypto.randomBytes(16).toString('hex');
-    //
-    // const passwordHash = crypto
-    //   .createHash('sha512')
-    //   .update(salt + password)
-    //   .digest('hex');
-    //
-    // const token = crypto
-    //   .createHash('sha512')
-    //   .update(passwordHash + salt + timestamp)
-    //   .digest('hex');
-    //
-    // return {
-    //   'auth-username': username,
-    //   'auth-ts': timestamp,
-    //   'auth-salt': salt,
-    //   'auth-token': token,
-    // };
   }
 
   async sendBundle(bundle: FHIRBundle): Promise<FHIRBundle> {

@@ -2,8 +2,10 @@
  * CDC (Change Data Capture) Service
  * Polls database for new sessions using watermark tracking
  * Processes records in batches and handles failures separately
+ * Uses node-cron for reliable scheduling
  */
 
+import * as cron from 'node-cron';
 import { getPool } from '../../shared/database/pool';
 import { AdapterService } from './adapter-service';
 import { getLogger } from '../../shared/utils/logger';
@@ -15,7 +17,9 @@ const logger = getLogger('cdc-service');
 interface CDCRecord {
   id: string;
   ingested_at: Date;
+  time: Date;  // Original timestamp from sessions table
   impilo_uid?: string;
+  impilo_id?: string;
   data: Record<string, unknown>;
 }
 
@@ -26,16 +30,17 @@ interface FailedRecord {
   attempt_count: number;
   last_error: string | null;
   impilo_uid?: string;
+  impilo_id?: string;
   data: Record<string, unknown>;
 }
 
 export class CDCService {
   private adapterService: AdapterService;
   private isPolling = false;
-  private pollInterval = 30000; // 30 seconds
-  private retryInterval = 300000; // 5 minutes
-  private pollTimer: NodeJS.Timeout | null = null;
-  private retryTimer: NodeJS.Timeout | null = null;
+  private pollCronSchedule = '*/30 * * * * *'; // Every 30 seconds
+  private retryCronSchedule = '*/5 * * * *'; // Every 5 minutes
+  private pollTask: cron.ScheduledTask | null = null;
+  private retryTask: cron.ScheduledTask | null = null;
   private batchSize = 100;
   private config = getConfig();
 
@@ -47,7 +52,6 @@ export class CDCService {
     if (this.isPolling) return;
 
     this.isPolling = true;
-    logger.info('CDC service started');
 
     const pool = getPool();
     try {
@@ -57,8 +61,17 @@ export class CDCService {
       throw error;
     }
 
-    void this.pollForNewSessions();
-    void this.retryFailedSessions();
+    // Schedule polling task (every 30 seconds)
+    this.pollTask = cron.schedule(this.pollCronSchedule, () => {
+      void this.pollForNewSessions();
+    });
+
+    // Schedule retry task (every 5 minutes)
+    this.retryTask = cron.schedule(this.retryCronSchedule, () => {
+      void this.retryFailedSessions();
+    });
+
+    logger.info('CDC service started with cron scheduler - poll: 30s, retry: 5m');
   }
 
   /**
@@ -67,14 +80,14 @@ export class CDCService {
   async stop(): Promise<void> {
     this.isPolling = false;
 
-    if (this.pollTimer) {
-      clearTimeout(this.pollTimer);
-      this.pollTimer = null;
+    if (this.pollTask) {
+      this.pollTask.stop();
+      this.pollTask = null;
     }
 
-    if (this.retryTimer) {
-      clearTimeout(this.retryTimer);
-      this.retryTimer = null;
+    if (this.retryTask) {
+      this.retryTask.stop();
+      this.retryTask = null;
     }
 
     logger.info('CDC service stopped');
@@ -93,11 +106,9 @@ export class CDCService {
       if (result.rows.length > 0) {
         await this.processBatch(result.rows);
       }
-    } catch {
-      logger.error('Polling error');
+    } catch (error) {
+      logger.error({ error }, 'Polling error');
     }
-
-    this.pollTimer = setTimeout(() => this.pollForNewSessions(), this.pollInterval);
   }
 
   private async processBatch(records: CDCRecord[]): Promise<void> {
@@ -145,6 +156,7 @@ export class CDCService {
 
   /**
    * Record failed session for retry
+   * Uses original 'time' timestamp from session, not ingested_at
    */
   private async recordFailure(record: CDCRecord, error: unknown): Promise<void> {
     try {
@@ -152,17 +164,19 @@ export class CDCService {
       const errorMessage = error instanceof Error ? error.message : String(error);
 
       // Store impilo_uid in the failed record if available
+      // Use record.time (original session timestamp) instead of record.ingested_at
       await pool.query(
-        'INSERT INTO cdc_failed_records (session_id, ingested_at, last_error, data, impilo_uid, created_at, last_attempt_at, attempt_count) ' +
-          'VALUES ($1, $2, $3, $4, $5, NOW(), NOW(), 1) ' +
+        'INSERT INTO cdc_failed_records (session_id, ingested_at, last_error, data, impilo_uid, impilo_id, created_at, last_attempt_at, attempt_count) ' +
+          'VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW(), 1) ' +
           'ON CONFLICT (session_id) DO UPDATE SET ' +
           'last_error = EXCLUDED.last_error, last_attempt_at = NOW(), attempt_count = cdc_failed_records.attempt_count + 1',
         [
           record.id,
-          record.ingested_at,
+          record.time,  // Use original session timestamp
           errorMessage,
           JSON.stringify(record.data),
           record.impilo_uid || null,
+          record.impilo_id || null,
         ]
       );
     } catch (err) {
@@ -183,11 +197,9 @@ export class CDCService {
       if (result.rows.length > 0) {
         await this.retryBatch(result.rows);
       }
-    } catch {
-      logger.error('Retry error');
+    } catch (error) {
+      logger.error({ error }, 'Retry error');
     }
-
-    this.retryTimer = setTimeout(() => this.retryFailedSessions(), this.retryInterval);
   }
 
   private async retryBatch(records: FailedRecord[]): Promise<void> {

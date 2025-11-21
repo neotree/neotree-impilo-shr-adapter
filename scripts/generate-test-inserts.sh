@@ -6,7 +6,7 @@
 set -e
 
 COUNT=${1:-1}
-STARTING_ID=${2:-497751}
+STARTING_ID=${2:-497753}
 OUTPUT_FILE=${3:-scripts/generated-inserts.sql}
 
 echo "Generating $COUNT test records starting from ID $STARTING_ID..."

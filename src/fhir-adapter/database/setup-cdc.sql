@@ -30,16 +30,19 @@ ON CONFLICT (table_name) DO NOTHING;
 
 -- Failed records tracking (separate from CDC flow)
 -- Failed records don't block new data processing
+-- Both impilo_id and data are stored as AES-256 encrypted text (iv:encrypted_value format)
 CREATE TABLE IF NOT EXISTS cdc_failed_records (
   id SERIAL PRIMARY KEY,
-  session_id BIGINT NOT NULL,
+  session_id BIGINT NOT NULL UNIQUE,
   ingested_at TIMESTAMP NOT NULL,
   attempt_count INTEGER DEFAULT 0,
   last_error TEXT,
   last_attempt_at TIMESTAMP,
   created_at TIMESTAMP DEFAULT NOW(),
   impilo_uid UUID,
-  data JSONB NOT NULL
+  impilo_id TEXT,  -- AES-256 encrypted (iv:encrypted_value format)
+  data TEXT NOT NULL,  -- AES-256 encrypted JSON string
+  synced BOOLEAN DEFAULT FALSE  -- Set to true after successful sync to OpenHIM
 );
 
 -- Indexes for performance
@@ -55,10 +58,12 @@ CREATE INDEX IF NOT EXISTS idx_cdc_failed_records_attempt
 -- Function to get new sessions since last watermark
 -- This function is generic and uses the table name from watermark tracking
 -- It reads the first (and should be only) entry from cdc_watermark
+-- Uses the original 'time' column from sessions table as timestamp
 CREATE OR REPLACE FUNCTION get_new_sessions(batch_size INTEGER DEFAULT 100)
 RETURNS TABLE(
   id BIGINT,
   ingested_at TIMESTAMP,
+  time TIMESTAMP,
   impilo_uid UUID,
   data JSONB
 ) AS $$
@@ -76,10 +81,12 @@ BEGIN
   END IF;
 
   -- Return new sessions since watermark using dynamic SQL
+  -- Returns both ingested_at (for watermark) and time (original timestamp from session)
   RETURN QUERY EXECUTE format(
     'SELECT
       s.id::BIGINT,
       s.ingested_at,
+      s.time,
       s.impilo_uid,
       s.data
     FROM %I s
@@ -111,12 +118,14 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- Function to record failed record
+-- Function to record failed record with encrypted data and impilo_id
 CREATE OR REPLACE FUNCTION record_failed_session(
   p_session_id BIGINT,
   p_ingested_at TIMESTAMP,
   p_error TEXT,
-  p_data JSONB
+  p_impilo_id TEXT,
+  p_data TEXT,
+  p_synced BOOLEAN DEFAULT FALSE
 )
 RETURNS VOID AS $$
 BEGIN
@@ -124,7 +133,9 @@ BEGIN
     session_id,
     ingested_at,
     last_error,
+    impilo_id,
     data,
+    synced,
     created_at,
     last_attempt_at,
     attempt_count
@@ -133,7 +144,9 @@ BEGIN
     p_session_id,
     p_ingested_at,
     p_error,
+    p_impilo_id,
     p_data,
+    p_synced,
     NOW(),
     NOW(),
     1
@@ -142,7 +155,8 @@ BEGIN
   DO UPDATE SET
     last_error = EXCLUDED.last_error,
     last_attempt_at = NOW(),
-    attempt_count = cdc_failed_records.attempt_count + 1;
+    attempt_count = cdc_failed_records.attempt_count + 1,
+    synced = EXCLUDED.synced;
 
   -- Add unique constraint if it doesn't exist
   -- This is handled by adding a unique index
@@ -162,10 +176,12 @@ RETURNS TABLE(
   attempt_count INTEGER,
   last_error TEXT,
   impilo_uid UUID,
-  data JSONB
+  impilo_id TEXT,
+  data TEXT,
+  synced BOOLEAN
 ) AS $$
 BEGIN
-  -- Get failed records that haven't been tried in last 5 minutes
+  -- Get failed records that haven't been tried in last 5 minutes and not yet synced
   RETURN QUERY
   SELECT
     f.id,
@@ -174,10 +190,13 @@ BEGIN
     f.attempt_count,
     f.last_error,
     f.impilo_uid,
-    f.data
+    f.impilo_id,
+    f.data,
+    f.synced
   FROM cdc_failed_records f
-  WHERE f.last_attempt_at IS NULL
-     OR f.last_attempt_at < NOW() - INTERVAL '5 minutes'
+  WHERE f.synced = FALSE
+    AND (f.last_attempt_at IS NULL
+     OR f.last_attempt_at < NOW() - INTERVAL '5 minutes')
   ORDER BY f.created_at ASC
   LIMIT batch_size;
 END;
@@ -191,10 +210,11 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- Function to update failed record after retry
+-- Function to update failed record after retry or successful sync
 CREATE OR REPLACE FUNCTION update_failed_session_retry(
   p_id INTEGER,
-  p_error TEXT
+  p_error TEXT,
+  p_synced BOOLEAN DEFAULT FALSE
 )
 RETURNS VOID AS $$
 BEGIN
@@ -202,7 +222,8 @@ BEGIN
   SET
     last_error = p_error,
     last_attempt_at = NOW(),
-    attempt_count = attempt_count + 1
+    attempt_count = attempt_count + 1,
+    synced = p_synced
   WHERE id = p_id;
 END;
 $$ LANGUAGE plpgsql;
