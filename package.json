@@ -1,5 +1,6 @@
 {
   "name": "neotree-impilo-shr-adapter",
+  "packageManager": "yarn@1.22.22",
   "version": "1.0.0",
   "description": "Production-grade FHIR adapter for Neotree to OpenCR via OpenHIM",
   "main": "dist/index.js",
