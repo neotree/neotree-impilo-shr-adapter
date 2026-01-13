@@ -102,6 +102,8 @@ export function mapNeotreeToPatientData(entry: NeotreeEntry): NeotreePatientData
   // Extract timestamps
   const admissionDateTime = getFieldValue(entries, 'DateTimeAdmission');
   const dischargeDateTime = getFieldValue(entries, 'DateTimeDischarge');
+  // Use completed_at from Neotree entry - this is when the form was submitted/completed
+  const completedAt = entry.completed_at;
 
   // Other clinical data
   const ethnicity = getFieldValue(entries, 'Ethnicity');
@@ -145,6 +147,7 @@ export function mapNeotreeToPatientData(entry: NeotreeEntry): NeotreePatientData
     // Timestamps
     admissionDateTime,
     dischargeDateTime,
+    completedAt,
 
     // Vital signs
     heartRate,

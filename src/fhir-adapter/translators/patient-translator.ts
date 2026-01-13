@@ -51,11 +51,15 @@ export class PatientTranslator {
 
   /**
    * Build patient identifiers
+   * Priority order (per FHIR mapping documentation):
+   * 1. Primary: impilo_neotree_id → urn:neotree:impilo-id
+   * 2. Secondary: patient_id → urn:impilo:uid
+   * 3. Tertiary: person_id → urn:impilo:person-id (facility-specific, nfor)
    */
   private buildIdentifiers(data: NeotreePatientData): Identifier[] {
     const identifiers: Identifier[] = [];
 
-    // Primary identifier: Neotree Patient ID
+    // Primary identifier: Neotree Patient ID (highest priority)
     identifiers.push({
       system: 'urn:neotree:impilo-id',
       value: data.uid,
@@ -66,6 +70,14 @@ export class PatientTranslator {
       identifiers.push({
         system: 'urn:impilo:uid',
         value: data.impilo_uid,
+      });
+    }
+
+    // Tertiary identifier: Person ID (facility-specific, nfor)
+    if (data.person_id) {
+      identifiers.push({
+        system: 'urn:impilo:person-id',
+        value: data.person_id,
       });
     }
 

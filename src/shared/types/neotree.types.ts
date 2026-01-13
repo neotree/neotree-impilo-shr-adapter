@@ -50,6 +50,7 @@ export interface NeotreePatientData {
   // Patient identifiers
   uid: string;
   impilo_uid?: string;
+  person_id?: string; // Facility-specific person ID (nfor)
   uniqueKey: string;
 
   // Baby details
@@ -85,6 +86,7 @@ export interface NeotreePatientData {
   // Timestamps
   admissionDateTime?: string;
   dischargeDateTime?: string;
+  completedAt?: string; // Timestamp when the encounter/observation was completed (from Neotree form completion)
 
   // Vital signs
   heartRate?: number;

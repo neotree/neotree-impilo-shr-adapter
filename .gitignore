@@ -12,4 +12,5 @@ coverage/
 *.pgpass
 !.pgpass.example
 *generated-inserts*
+dist/*
 

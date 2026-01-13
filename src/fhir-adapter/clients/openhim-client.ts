@@ -62,12 +62,40 @@ export class OpenHIMClient {
     };
   }
 
+  /**
+   * Send bundle to Client Registry (CR) endpoint
+   * Used for demographics (Patient + RelatedPerson)
+   */
+  async sendBundleToCR(bundle: FHIRBundle): Promise<FHIRBundle> {
+    return this.sendBundleToEndpoint(bundle, this.config.openhim.crEndpoint);
+  }
+
+  /**
+   * Send bundle to Shared Health Record (SHR) endpoint
+   * Used for clinical data (Encounters, Observations, Conditions)
+   */
+  async sendBundleToSHR(bundle: FHIRBundle): Promise<FHIRBundle> {
+    return this.sendBundleToEndpoint(bundle, this.config.openhim.shrEndpoint);
+  }
+
+  /**
+   * Send bundle to specified endpoint (with automatic routing)
+   * Falls back to legacy channelPath if endpoint-specific endpoints not available
+   */
   async sendBundle(bundle: FHIRBundle): Promise<FHIRBundle> {
+    // Default to CR endpoint for backward compatibility
+    return this.sendBundleToEndpoint(bundle, this.config.openhim.channelPath);
+  }
+
+  /**
+   * Internal method to send bundle to any endpoint
+   */
+  private async sendBundleToEndpoint(bundle: FHIRBundle, endpoint: string): Promise<FHIRBundle> {
     try {
       const authHeaders = this.generateAuthHeaders();
 
       const response = await this.client.post<FHIRBundle>(
-        this.config.openhim.channelPath,
+        endpoint,
         bundle,
         {
           headers: {
@@ -147,6 +175,58 @@ export class OpenHIMClient {
       return null;
     } catch (error) {
       logger.error('Query failed');
+      throw error;
+    }
+  }
+
+  /**
+   * Retrieve patient data from Client Registry (CR)
+   * Used during retry scenarios to pull existing patient without creating duplicates
+   */
+  async getPatientFromCR(
+    identifierSystem: string,
+    identifierValue: string
+  ): Promise<FHIRPatient | null> {
+    try {
+      const authHeaders = this.generateAuthHeaders();
+
+      logger.debug(
+        { identifierSystem, identifierValue },
+        'Retrieving patient from Client Registry'
+      );
+
+      const response = await this.client.get<FHIRBundle>(
+        `${this.config.openhim.crEndpoint}/Patient`,
+        {
+          params: {
+            identifier: `${identifierSystem}|${identifierValue}`,
+          },
+          headers: {
+            ...authHeaders,
+            'X-OpenHIM-ClientID': this.config.openhim.clientId || this.config.source.id,
+          },
+        }
+      );
+
+      if (response.data.entry && response.data.entry.length > 0) {
+        const patient = response.data.entry[0].resource as FHIRPatient;
+        logger.info(
+          { patientId: patient.id, identifierValue },
+          'Successfully retrieved patient from Client Registry'
+        );
+        return patient;
+      }
+
+      logger.warn(
+        { identifierSystem, identifierValue },
+        'No patient found in Client Registry'
+      );
+      return null;
+    } catch (error) {
+      logger.error(
+        { identifierValue, error: error instanceof Error ? error.message : String(error) },
+        'Failed to retrieve patient from Client Registry'
+      );
       throw error;
     }
   }

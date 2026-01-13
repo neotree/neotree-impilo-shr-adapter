@@ -38,6 +38,8 @@ const ConfigSchema = z.object({
     username: z.string(),
     password: z.string(),
     channelPath: z.string(),
+    crEndpoint: z.string().default('/CR/fhir'),
+    shrEndpoint: z.string().default('/SHR/fhir'),
     clientId: z.string().optional(),
   }),
 
@@ -95,6 +97,8 @@ export function loadConfig(): Config {
       username: process.env.OPENHIM_USERNAME,
       password: process.env.OPENHIM_PASSWORD,
       channelPath: process.env.OPENHIM_CHANNEL_PATH || '/fhir',
+      crEndpoint: process.env.OPENHIM_CR_ENDPOINT || '/CR/fhir',
+      shrEndpoint: process.env.OPENHIM_SHR_ENDPOINT || '/SHR/fhir',
       clientId: process.env.OPENHIM_CLIENT_ID || process.env.FACILITY_ID || process.env.SOURCE_ID,
     },
 

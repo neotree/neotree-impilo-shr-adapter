@@ -119,9 +119,11 @@ export class EncounterTranslator {
 
   /**
    * Build encounter period
+   * Uses completedAt (form submission time) as period.end if available,
+   * otherwise falls back to dischargeDateTime
    */
   private buildPeriod(data: NeotreePatientData): Period | undefined {
-    if (!data.admissionDateTime && !data.dischargeDateTime) {
+    if (!data.admissionDateTime && !data.dischargeDateTime && !data.completedAt) {
       return undefined;
     }
 
@@ -131,7 +133,11 @@ export class EncounterTranslator {
       period.start = new Date(data.admissionDateTime).toISOString();
     }
 
-    if (data.dischargeDateTime) {
+    // Use completedAt as period.end (when encounter data was finalized)
+    // Fall back to dischargeDateTime if completedAt is not available
+    if (data.completedAt) {
+      period.end = new Date(data.completedAt).toISOString();
+    } else if (data.dischargeDateTime) {
       period.end = new Date(data.dischargeDateTime).toISOString();
     }
 

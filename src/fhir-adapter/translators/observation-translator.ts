@@ -105,7 +105,8 @@ export class ObservationTranslator {
               code,
               measurement.value,
               'vital-signs',
-              data.admissionDateTime || data.dateOfBirth
+              // Use completedAt (when observation was recorded/completed) if available, otherwise admissionDateTime, then dateOfBirth
+              data.completedAt || data.admissionDateTime || data.dateOfBirth
             )
           );
         }
@@ -124,7 +125,8 @@ export class ObservationTranslator {
               code,
               measurement.value,
               'vital-signs',
-              data.dateOfBirth
+              // Use completedAt for body measurements as well
+              data.completedAt || data.dateOfBirth
             )
           );
         }
@@ -295,7 +297,10 @@ export class ObservationTranslator {
       subject: {
         reference: patientReference,
       },
-      effectiveDateTime: data.dateOfBirth
+      // Use completedAt if available, otherwise calculate from dateOfBirth
+      effectiveDateTime: data.completedAt
+        ? this.calculateApgarTime(data.completedAt, minutes)
+        : data.dateOfBirth
         ? this.calculateApgarTime(data.dateOfBirth, minutes)
         : undefined,
       valueQuantity: {
