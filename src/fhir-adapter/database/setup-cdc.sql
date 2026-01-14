@@ -31,7 +31,8 @@ ON CONFLICT (table_name) DO NOTHING;
 -- Failed records tracking (separate from CDC flow)
 -- Failed records don't block new data processing
 -- Both impilo_id and data are stored as AES-256 encrypted text (iv:encrypted_value format)
-CREATE TABLE IF NOT EXISTS cdc_failed_records (
+DROP TABLE IF EXISTS cdc_failed_records CASCADE;
+CREATE TABLE cdc_failed_records (
   id SERIAL PRIMARY KEY,
   session_id BIGINT NOT NULL UNIQUE,
   ingested_at TIMESTAMP NOT NULL,
@@ -42,13 +43,14 @@ CREATE TABLE IF NOT EXISTS cdc_failed_records (
   impilo_uid UUID,
   impilo_id TEXT,  -- AES-256 encrypted (iv:encrypted_value format)
   data TEXT NOT NULL,  -- AES-256 encrypted JSON string
-  synced BOOLEAN DEFAULT FALSE  -- Set to true after successful sync to OpenHIM
+  synced BOOLEAN DEFAULT FALSE,  -- Set to true after BOTH CR and SHR successful
+  cr_synced BOOLEAN DEFAULT FALSE, -- Phase 1: Client Registry
+  shr_synced BOOLEAN DEFAULT FALSE -- Phase 2: Shared Health Record
 );
 
 -- Indexes for performance
 CREATE INDEX IF NOT EXISTS idx_cdc_failed_records_attempt
-  ON cdc_failed_records(last_attempt_at)
-  WHERE last_attempt_at IS NULL OR last_attempt_at < NOW() - INTERVAL '5 minutes';
+  ON cdc_failed_records(last_attempt_at);
 
 -- Create index on source table using psql meta-command
 -- Note: This requires the table to already exist
@@ -63,13 +65,15 @@ CREATE OR REPLACE FUNCTION get_new_sessions(batch_size INTEGER DEFAULT 100)
 RETURNS TABLE(
   id BIGINT,
   ingested_at TIMESTAMP,
-  time TIMESTAMP,
+  session_time TIMESTAMP,
   impilo_uid UUID,
   data JSONB
 ) AS $$
 DECLARE
   last_watermark TIMESTAMP;
   table_name_var TEXT;
+  time_col TEXT;
+  uid_col TEXT;
 BEGIN
   -- Get current watermark and table name (use the first entry in watermark table)
   SELECT w.last_ingested_at, w.table_name INTO last_watermark, table_name_var
@@ -80,20 +84,38 @@ BEGIN
     RAISE EXCEPTION 'No watermark found in cdc_watermark table';
   END IF;
 
-  -- Return new sessions since watermark using dynamic SQL
-  -- Returns both ingested_at (for watermark) and time (original timestamp from session)
+  -- Check for column existence once
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns 
+    WHERE table_name = table_name_var AND column_name = 'time'
+  ) THEN
+    time_col := 's.time';
+  ELSE
+    time_col := 's.ingested_at';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns 
+    WHERE table_name = table_name_var AND column_name = 'impilo_uid'
+  ) THEN
+    uid_col := 's.impilo_uid';
+  ELSE
+    uid_col := 'NULL::UUID';
+  END IF;
+
+  -- Return new sessions since watermark using dynamic SQL construction
   RETURN QUERY EXECUTE format(
     'SELECT
       s.id::BIGINT,
       s.ingested_at,
-      s.time,
-      s.impilo_uid,
+      %s as session_time,
+      %s as impilo_uid,
       s.data
     FROM %I s
     WHERE s.ingested_at > $1
     ORDER BY s.ingested_at ASC, s.id ASC
     LIMIT $2',
-    table_name_var
+    time_col, uid_col, table_name_var
   ) USING last_watermark, batch_size;
 END;
 $$ LANGUAGE plpgsql;
@@ -125,7 +147,10 @@ CREATE OR REPLACE FUNCTION record_failed_session(
   p_error TEXT,
   p_impilo_id TEXT,
   p_data TEXT,
-  p_synced BOOLEAN DEFAULT FALSE
+  p_synced BOOLEAN DEFAULT FALSE,
+  p_cr_synced BOOLEAN DEFAULT FALSE,
+  p_shr_synced BOOLEAN DEFAULT FALSE,
+  p_impilo_uid UUID DEFAULT NULL
 )
 RETURNS VOID AS $$
 BEGIN
@@ -136,6 +161,9 @@ BEGIN
     impilo_id,
     data,
     synced,
+    cr_synced,
+    shr_synced,
+    impilo_uid,
     created_at,
     last_attempt_at,
     attempt_count
@@ -147,6 +175,9 @@ BEGIN
     p_impilo_id,
     p_data,
     p_synced,
+    p_cr_synced,
+    p_shr_synced,
+    p_impilo_uid,
     NOW(),
     NOW(),
     1
@@ -156,7 +187,10 @@ BEGIN
     last_error = EXCLUDED.last_error,
     last_attempt_at = NOW(),
     attempt_count = cdc_failed_records.attempt_count + 1,
-    synced = EXCLUDED.synced;
+    synced = EXCLUDED.synced,
+    cr_synced = EXCLUDED.cr_synced,
+    shr_synced = EXCLUDED.shr_synced,
+    impilo_uid = COALESCE(EXCLUDED.impilo_uid, cdc_failed_records.impilo_uid);
 
   -- Add unique constraint if it doesn't exist
   -- This is handled by adding a unique index
@@ -178,10 +212,12 @@ RETURNS TABLE(
   impilo_uid UUID,
   impilo_id TEXT,
   data TEXT,
-  synced BOOLEAN
+  synced BOOLEAN,
+  cr_synced BOOLEAN,
+  shr_synced BOOLEAN
 ) AS $$
 BEGIN
-  -- Get failed records that haven't been tried in last 5 minutes and not yet synced
+  -- Get failed records that haven't been tried in last 5 minutes and not yet fully synced
   RETURN QUERY
   SELECT
     f.id,
@@ -192,7 +228,9 @@ BEGIN
     f.impilo_uid,
     f.impilo_id,
     f.data,
-    f.synced
+    f.synced,
+    f.cr_synced,
+    f.shr_synced
   FROM cdc_failed_records f
   WHERE f.synced = FALSE
     AND (f.last_attempt_at IS NULL
@@ -214,7 +252,9 @@ $$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION update_failed_session_retry(
   p_id INTEGER,
   p_error TEXT,
-  p_synced BOOLEAN DEFAULT FALSE
+  p_synced BOOLEAN DEFAULT FALSE,
+  p_cr_synced BOOLEAN DEFAULT FALSE,
+  p_shr_synced BOOLEAN DEFAULT FALSE
 )
 RETURNS VOID AS $$
 BEGIN
@@ -223,7 +263,9 @@ BEGIN
     last_error = p_error,
     last_attempt_at = NOW(),
     attempt_count = attempt_count + 1,
-    synced = p_synced
+    synced = p_synced,
+    cr_synced = p_cr_synced,
+    shr_synced = p_shr_synced
   WHERE id = p_id;
 END;
 $$ LANGUAGE plpgsql;
@@ -252,22 +294,26 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON cdc_failed_records TO PUBLIC;
 GRANT USAGE, SELECT ON SEQUENCE cdc_failed_records_id_seq TO PUBLIC;
 
 -- Success message with table and watermark info
-SELECT
-  '✓ CDC watermark tracking created' as message
-UNION ALL SELECT '✓ Failed records table created'
-UNION ALL SELECT '✓ CDC functions installed'
-UNION ALL SELECT ''
-UNION ALL SELECT 'CDC System Ready:'
-UNION ALL SELECT '  • Watermark initialized for ' || table_name || ' table'
-  FROM cdc_watermark LIMIT 1
-UNION ALL SELECT '  • Starting from: ' || to_char(last_ingested_at, 'YYYY-MM-DD HH24:MI:SS')
-  FROM cdc_watermark LIMIT 1
-UNION ALL SELECT '  • Failed records are tracked separately'
-UNION ALL SELECT '  • Adapter will poll for new sessions every 30 seconds'
-UNION ALL SELECT '  • Failed retries every 5 minutes automatically'
-UNION ALL SELECT ''
-UNION ALL SELECT 'Monitoring:'
-UNION ALL SELECT '  • Check watermark: SELECT * FROM cdc_watermark;'
-UNION ALL SELECT '  • Check failed: SELECT * FROM cdc_failed_records;'
-UNION ALL SELECT '  • Reset watermark: SELECT reset_watermark(''' || table_name || ''', ''2024-01-01'');'
-  FROM cdc_watermark LIMIT 1;
+DO $$
+DECLARE
+    v_table_name TEXT;
+    v_last_ingested_at TIMESTAMP;
+BEGIN
+    SELECT table_name, last_ingested_at INTO v_table_name, v_last_ingested_at FROM cdc_watermark LIMIT 1;
+    
+    RAISE NOTICE '✓ CDC watermark tracking created';
+    RAISE NOTICE '✓ Failed records table created';
+    RAISE NOTICE '✓ CDC functions installed';
+    RAISE NOTICE '';
+    RAISE NOTICE 'CDC System Ready:';
+    RAISE NOTICE '  • Watermark initialized for % table', v_table_name;
+    RAISE NOTICE '  • Starting from: %', to_char(v_last_ingested_at, 'YYYY-MM-DD HH24:MI:SS');
+    RAISE NOTICE '  • Failed records are tracked separately';
+    RAISE NOTICE '  • Adapter will poll for new sessions every 30 seconds';
+    RAISE NOTICE '  • Failed retries every 5 minutes automatically';
+    RAISE NOTICE '';
+    RAISE NOTICE 'Monitoring:';
+    RAISE NOTICE '  • Check watermark: SELECT * FROM cdc_watermark;';
+    RAISE NOTICE '  • Check failed: SELECT * FROM cdc_failed_records;';
+    RAISE NOTICE '  • Reset watermark: SELECT reset_watermark(''%'', ''2024-01-01'');', v_table_name;
+END $$;

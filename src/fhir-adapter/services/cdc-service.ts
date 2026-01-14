@@ -17,7 +17,7 @@ const logger = getLogger('cdc-service');
 interface CDCRecord {
   id: string;
   ingested_at: Date;
-  time: Date;  // Original timestamp from sessions table
+  session_time: Date;  // Changed from time to session_time
   impilo_uid?: string;
   impilo_id?: string;
   data: Record<string, unknown>;
@@ -31,7 +31,10 @@ interface FailedRecord {
   last_error: string | null;
   impilo_uid?: string;
   impilo_id?: string;
-  data: Record<string, unknown>;
+  data: string; // Changed to string for FailedSyncRecord compatibility
+  synced: boolean;
+  cr_synced: boolean;
+  shr_synced: boolean;
 }
 
 export class CDCService {
@@ -81,12 +84,12 @@ export class CDCService {
     this.isPolling = false;
 
     if (this.pollTask) {
-      this.pollTask.stop();
+      void this.pollTask.stop();
       this.pollTask = null;
     }
 
     if (this.retryTask) {
-      this.retryTask.stop();
+      void this.retryTask.stop();
       this.retryTask = null;
     }
 
@@ -116,14 +119,30 @@ export class CDCService {
     let failureCount = 0;
 
     for (const record of records) {
+      let crSynced = false;
+      let shrSynced = false;
       try {
         const entry = this.convertToNeotreeEntry(record.data, record.impilo_uid);
-        await this.adapterService.processEntry(entry);
-        successCount++;
+        
+        // Phase 1: CR Push
+        try {
+          logger.info({ sessionId: record.id }, 'Phase 1: Pushing demographics to CR');
+          // We'll use a modified dual flow that can track progress
+          await this.adapterService.processEntryWithDualFlow(entry);
+          crSynced = true;
+          shrSynced = true; // If processEntryWithDualFlow returns, both succeeded in original impl
+          successCount++;
+          logger.info({ sessionId: record.id }, 'Successfully processed session with dual-flow (CR + SHR)');
+        } catch (dualError) {
+          // If it fails, we need to know how far it got. 
+          // For now, if it throws, we record failure but our recordFailure now supports tracking
+          failureCount++;
+          await this.recordFailureWithStatus(record, dualError, crSynced, shrSynced);
+        }
       } catch (error) {
         failureCount++;
-        await this.recordFailure(record, error);
-        logger.error({ sessionId: record.id }, 'Failed to process session');
+        await this.recordFailureWithStatus(record, error, crSynced, shrSynced);
+        logger.error({ sessionId: record.id, error: error instanceof Error ? error.message : String(error) }, 'Failed to convert or process session');
       }
     }
 
@@ -158,25 +177,28 @@ export class CDCService {
    * Record failed session for retry
    * Uses original 'time' timestamp from session, not ingested_at
    */
-  private async recordFailure(record: CDCRecord, error: unknown): Promise<void> {
+  private async recordFailureWithStatus(
+    record: CDCRecord,
+    error: unknown,
+    crSynced = false,
+    shrSynced = false
+  ): Promise<void> {
     try {
       const pool = getPool();
       const errorMessage = error instanceof Error ? error.message : String(error);
 
-      // Store impilo_uid in the failed record if available
-      // Use record.time (original session timestamp) instead of record.ingested_at
       await pool.query(
-        'INSERT INTO cdc_failed_records (session_id, ingested_at, last_error, data, impilo_uid, impilo_id, created_at, last_attempt_at, attempt_count) ' +
-          'VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW(), 1) ' +
-          'ON CONFLICT (session_id) DO UPDATE SET ' +
-          'last_error = EXCLUDED.last_error, last_attempt_at = NOW(), attempt_count = cdc_failed_records.attempt_count + 1',
+        'SELECT record_failed_session($1, $2, $3, $4, $5, $6, $7, $8, $9)',
         [
           record.id,
-          record.time,  // Use original session timestamp
+          record.session_time, // Use session_time instead of time
           errorMessage,
-          JSON.stringify(record.data),
-          record.impilo_uid || null,
           record.impilo_id || null,
+          JSON.stringify(record.data),
+          crSynced && shrSynced, // overall synced
+          crSynced,
+          shrSynced,
+          record.impilo_uid || null,
         ]
       );
     } catch (err) {
@@ -203,18 +225,20 @@ export class CDCService {
   }
 
   private async retryBatch(records: FailedRecord[]): Promise<void> {
-    const pool = getPool();
-
     for (const record of records) {
       try {
-        const entry = this.convertToNeotreeEntry(record.data, record.impilo_uid);
-        await this.adapterService.processEntry(entry);
-        await pool.query('SELECT remove_failed_session($1)', [record.id]);
+        // Map FailedRecord to FailedSyncRecord for the adapter service
+        const syncRecord = {
+          ...record,
+          session_id: BigInt(record.session_id),
+          impilo_uid: record.impilo_uid || null,
+          impilo_id: record.impilo_id || null,
+        };
+
+        await this.adapterService.processSyncedEntry(syncRecord);
         logger.info({ sessionId: record.session_id }, 'Retry successful');
       } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        await pool.query('SELECT update_failed_session_retry($1, $2)', [record.id, errorMessage]);
-        logger.warn({ sessionId: record.session_id }, 'Retry failed');
+        logger.warn({ sessionId: record.session_id, error: error instanceof Error ? error.message : String(error) }, 'Retry failed');
       }
     }
   }

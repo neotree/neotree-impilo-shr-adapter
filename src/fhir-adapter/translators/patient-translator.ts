@@ -16,6 +16,7 @@ export class PatientTranslator {
   private config = getConfig();
 
   translate(data: NeotreePatientData): FHIRPatient {
+    console.log("...............OOOO---",data)
     try {
       const patient: FHIRPatient = {
         resourceType: 'Patient',

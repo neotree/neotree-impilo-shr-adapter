@@ -29,6 +29,8 @@ export interface FailedSyncRecord {
   impilo_id: string | null;
   data: string;
   synced: boolean;
+  cr_synced: boolean;
+  shr_synced: boolean;
 }
 
 export class AdapterService {
@@ -72,6 +74,8 @@ export class AdapterService {
     let decryptedData: unknown;
     let decryptedImpiloId: string;
     let neotreeEntry: NeotreeEntry | null = null;
+    let crSuccess = record.cr_synced;
+    let shrSuccess = record.shr_synced;
 
     try {
       // Step 1: Decrypt the data and impilo_id
@@ -88,237 +92,104 @@ export class AdapterService {
       decryptedImpiloId = decryptedSyncData.impiloId;
       decryptedData = decryptedSyncData.data;
 
-      logger.info(
-        { recordId: record.id, impiloId: decryptedImpiloId },
-        'Successfully decrypted sync record'
-      );
-
-      // Step 2: Format the data - check if it's already structured as Neotree entry or raw data
+      // Step 2: Format the data
       let patientData;
       if (typeof decryptedData === 'object' && decryptedData !== null && 'script' in decryptedData) {
-        // It's a Neotree entry - store for later reference
         neotreeEntry = decryptedData as NeotreeEntry;
         patientData = mapNeotreeToPatientData(neotreeEntry);
       } else {
-        // Assume it's already formatted patient data
         patientData = decryptedData as unknown;
       }
 
-      // Validate the patient data
-      let validationResult;
-      try {
-        validationResult = validateAllResources(patientData as any);
-      } catch {
-        // If validation fails on unknown type, assume it's valid for now
-        validationResult = { canProceed: true, patient: { missingFields: [] } };
-      }
-      if (!validationResult.canProceed) {
-        throw new Error(
-          `Validation failed: missing required fields [${validationResult.patient.missingFields.join(', ')}]`
-        );
-      }
-
-      const patient = this.patientTranslator.translate(patientData as any);
-
-      // Check missing data
-      const missingDataReport = this.missingDataHandler.analyzeMissingData(
-        patient,
-        decryptedImpiloId
-      );
-      if (!missingDataReport.canProceed) {
-        throw new Error(
-          `Critical fields missing: [${missingDataReport.criticalFieldsMissing.join(', ')}]`
-        );
-      }
-
-      // Step 3: Try to retrieve existing patient from Client Registry
-      logger.debug(
-        { recordId: record.id, impiloId: decryptedImpiloId },
-        'Attempting to retrieve existing patient from CR'
-      );
-
-      const neotreeIdentifier = (patientData as any).uid;
-      const neotreeIdentifierSystem = `urn:neotree:impilo-id`;
-
-      let existingCRPatient: FHIRPatient | null = null;
-      try {
-        existingCRPatient = await this.openhimClient.getPatientFromCR(
-          neotreeIdentifierSystem,
-          neotreeIdentifier
-        );
-      } catch (error) {
-        logger.debug(
-          {
-            recordId: record.id,
-            error: error instanceof Error ? error.message : String(error),
-          },
-          'CR retrieval failed - will proceed with full dual-flow'
-        );
-      }
-
-      // Step 4: Process based on whether patient exists in CR
-      if (existingCRPatient) {
-        logger.info(
-          {
-            recordId: record.id,
-            impiloId: decryptedImpiloId,
-            patientId: existingCRPatient.id,
-          },
-          'Patient already exists in CR - proceeding with SHR-only push'
-        );
-
-        // SHR-only push (patient already in CR from previous successful push)
-        if (!neotreeEntry) {
-          throw new Error('Cannot perform SHR-only push without Neotree entry');
-        }
-
-        const patientReference = `Patient/${existingCRPatient.id}`;
-        const encounter = this.encounterTranslator.translate(
-          patientData as any,
-          patientReference
-        );
-        const observations = this.observationTranslator.translate(
-          patientData as any,
-          patientReference,
-          `Encounter/${encounter.id || neotreeEntry.uid}`
-        );
-        const conditions = this.conditionTranslator.translate(
-          patientData as any,
-          patientReference,
-          `Encounter/${encounter.id || neotreeEntry.uid}`
-        );
-
-        const shrBundle = BundleBuilder.createSHRBundle(encounter, observations, conditions);
-        logger.debug(
-          { recordId: record.id, entryCount: shrBundle.entry?.length || 0 },
-          'Sending SHR-only bundle to retry push'
-        );
-        await this.openhimClient.sendBundleToSHR(shrBundle);
-
-        logger.info(
-          {
-            recordId: record.id,
-            impiloId: decryptedImpiloId,
-            action: 'shr-only-push',
-            patientId: existingCRPatient.id,
-          },
-          'Successfully sent clinical data to SHR for retry'
-        );
-      } else {
-        logger.info(
-          { recordId: record.id, impiloId: decryptedImpiloId },
-          'Patient not in CR - performing full legacy dual-flow push'
-        );
-
-        // Full dual-flow push (patient not yet in CR)
-        // Check for duplicates
-        const searchParams: Record<string, string> = {};
-        if (patient.identifier?.[0]?.value) {
-          searchParams.identifier = `${patient.identifier[0].system}|${patient.identifier[0].value}`;
-        }
-        if (patient.birthDate) {
-          searchParams.birthdate = patient.birthDate;
-        }
-
-        let finalPatient = patient;
-        let isUpdate = false;
-
-        if (Object.keys(searchParams).length > 0) {
-          try {
-            const searchResults = await this.openhimClient.searchPatients(searchParams);
-            const duplicates = await this.duplicateDetection.findPotentialDuplicates(
-              patient,
-              searchResults
-            );
-
-            if (duplicates.length > 0) {
-              const match = duplicates[0];
-              if (match.score.matchLevel === 'auto-match') {
-                logger.info(
-                  {
-                    recordId: record.id,
-                    matchScore: match.score.totalScore,
-                    existingPatientId: match.patient.id,
-                  },
-                  'Auto-match found - updating existing patient'
-                );
-                finalPatient = this.missingDataHandler.mergePatientData(
-                  patient,
-                  match.patient
-                );
-                finalPatient.id = match.patient.id;
-                isUpdate = true;
-              } else if (match.score.matchLevel === 'potential-match') {
-                logger.warn(
-                  {
-                    recordId: record.id,
-                    matchScore: match.score.totalScore,
-                    existingPatientId: match.patient.id,
-                  },
-                  'Potential duplicate - creating new patient'
-                );
-              }
-            }
-          } catch (error) {
-            logger.warn(
-              {
-                recordId: record.id,
-                error: error instanceof Error ? error.message : String(error),
-              },
-              'Duplicate search failed - creating new patient'
-            );
+      // Step 3: Phase 1 - Client Registry (if not already synced)
+      if (!crSuccess) {
+        try {
+          logger.info({ recordId: record.id, impiloId: decryptedImpiloId }, 'Phase 1: Pushing demographics to Client Registry (CR)');
+          
+          const patient = this.patientTranslator.translate(patientData as any);
+          
+          // Check for duplicates before pushing
+          const searchParams: Record<string, string> = {};
+          if (patient.identifier?.[0]?.value) {
+            searchParams.identifier = `${patient.identifier[0].system}|${patient.identifier[0].value}`;
           }
+          
+          let finalPatient = patient;
+          if (Object.keys(searchParams).length > 0) {
+            try {
+              const searchResults = await this.openhimClient.searchPatients(searchParams);
+              const duplicates = await this.duplicateDetection.findPotentialDuplicates(patient, searchResults);
+              if (duplicates.length > 0 && duplicates[0].score.matchLevel === 'auto-match') {
+                finalPatient = this.missingDataHandler.mergePatientData(patient, duplicates[0].patient);
+                finalPatient.id = duplicates[0].patient.id;
+              }
+            } catch {
+              logger.warn({ recordId: record.id }, 'Duplicate search failed, proceeding with original patient data');
+            }
+          }
+
+          const relatedPerson = this.relatedPersonTranslator.translate(patientData as any, `Patient/${finalPatient.id || 'new'}`);
+          const crBundle = BundleBuilder.createCRBundle(finalPatient, relatedPerson);
+          await this.openhimClient.sendBundleToCR(crBundle);
+          
+          crSuccess = true;
+          logger.info({ recordId: record.id, impiloId: decryptedImpiloId }, 'Phase 1 Success: Client Registry push completed');
+        } catch (error) {
+          logger.error({ recordId: record.id, error: error instanceof Error ? error.message : String(error) }, 'Phase 1 Failed: Client Registry push failed');
+          throw error; // Re-throw to update status with failure
         }
-
-        // Step 5: Send to OpenHIM (legacy single bundle)
-        const fhirBundle = BundleBuilder.createTransactionBundle(finalPatient);
-        await this.openhimClient.sendBundle(fhirBundle);
-
-        logger.info(
-          {
-            recordId: record.id,
-            impiloId: decryptedImpiloId,
-            action: isUpdate ? 'updated' : 'created',
-          },
-          'Successfully sent legacy bundle to OpenHIM'
-        );
+      } else {
+        logger.info({ recordId: record.id }, 'Phase 1 Skip: Already synced to Client Registry');
       }
 
-      // Step 6: On success, mark as synced
+      // Step 4: Phase 2 - Shared Health Record (if CR is successful and SHR not yet synced)
+      if (crSuccess && !shrSuccess) {
+        try {
+          logger.info({ recordId: record.id, impiloId: decryptedImpiloId }, 'Phase 2: Pushing clinical data to Shared Health Record (SHR)');
+          
+          // We need the patient ID from CR for clinical data linkage
+          const neotreeIdentifier = (patientData as any).uid;
+          const neotreeIdentifierSystem = `urn:neotree:impilo-id`;
+          const crPatient = await this.openhimClient.getPatientFromCR(neotreeIdentifierSystem, neotreeIdentifier);
+          
+          if (!crPatient || !crPatient.id) {
+            throw new Error('Cannot link clinical data: Patient not found in CR');
+          }
+
+          const patientReference = `Patient/${crPatient.id}`;
+          const encounter = this.encounterTranslator.translate(patientData as any, patientReference);
+          const observations = this.observationTranslator.translate(patientData as any, patientReference, `Encounter/${encounter.id || (neotreeEntry?.uid)}`);
+          const conditions = this.conditionTranslator.translate(patientData as any, patientReference, `Encounter/${encounter.id || (neotreeEntry?.uid)}`);
+
+          const shrBundle = BundleBuilder.createSHRBundle(encounter, observations, conditions);
+          await this.openhimClient.sendBundleToSHR(shrBundle);
+          
+          shrSuccess = true;
+          logger.info({ recordId: record.id, impiloId: decryptedImpiloId }, 'Phase 2 Success: Shared Health Record push completed');
+        } catch (error) {
+          logger.error({ recordId: record.id, error: error instanceof Error ? error.message : String(error) }, 'Phase 2 Failed: Shared Health Record push failed');
+          throw error;
+        }
+      } else if (!crSuccess) {
+        logger.warn({ recordId: record.id }, 'Phase 2 Delayed: Waiting for Phase 1 (CR) to succeed');
+      } else {
+        logger.info({ recordId: record.id }, 'Phase 2 Skip: Already synced to Shared Health Record');
+      }
+
+      // Step 5: Update overall sync status
+      const fullySynced = crSuccess && shrSuccess;
       await this.pool.query(
-        `UPDATE cdc_failed_records
-         SET synced = true, last_error = NULL
-         WHERE id = $1`,
-        [record.id]
+        `SELECT update_failed_session_retry($1, $2, $3, $4, $5)`,
+        [record.id, null, fullySynced, crSuccess, shrSuccess]
       );
 
-      logger.info(
-        { recordId: record.id, impiloId: decryptedImpiloId },
-        'Updated failed record: synced marked as true'
-      );
+      logger.info({ recordId: record.id, fullySynced }, 'Successfully updated record sync status');
     } catch (error) {
-      // Step 7: On failure, keep encrypted and update error
       const errorMessage = error instanceof Error ? error.message : String(error);
-      logger.error(
-        { recordId: record.id, error: errorMessage },
-        'Failed to process synced entry - keeping encrypted for retry'
+      await this.pool.query(
+        `SELECT update_failed_session_retry($1, $2, $3, $4, $5)`,
+        [record.id, errorMessage, false, crSuccess, shrSuccess]
       );
-
-      try {
-        await this.pool.query(
-          `SELECT update_failed_session_retry($1, $2, $3)`,
-          [record.id, errorMessage, false]
-        );
-      } catch (updateError) {
-        logger.error(
-          {
-            recordId: record.id,
-            updateError: updateError instanceof Error ? updateError.message : String(updateError),
-          },
-          'Failed to update failed record status'
-        );
-      }
-
       throw error;
     }
   }
