@@ -1,5 +1,5 @@
 import { v4 as uuidv4 } from 'uuid';
-import { FHIRBundle, BundleEntry, FHIRResource, FHIRPatient, FHIRRelatedPerson, FHIREncounter, FHIRObservation, FHIRCondition } from '../../shared/types/fhir.types';
+import { FHIRBundle, BundleEntry, FHIRResource, FHIRPatient, FHIRRelatedPerson, FHIREncounter, FHIRObservation, FHIRCondition, FHIRQuestionnaireResponse } from '../../shared/types/fhir.types';
 import { getLogger } from '../../shared/utils/logger';
 
 const logger = getLogger('bundle-builder');
@@ -8,33 +8,23 @@ export class BundleBuilder {
   /**
    * Create a Client Registry (CR) bundle with Patient + RelatedPerson
    * Sends demographic information to CR
+   * Always uses POST to create new patient records (CR handles deduplication)
    */
   static createCRBundle(patient: FHIRPatient, relatedPerson?: FHIRRelatedPerson | null): FHIRBundle {
     logger.debug('Building Client Registry bundle');
 
     const entries: BundleEntry[] = [];
 
-    // Add Patient resource
-    if (patient.id) {
-      entries.push({
-        fullUrl: `Patient/${patient.id}`,
-        resource: patient,
-        request: {
-          method: 'PUT',
-          url: `Patient/${patient.id}`,
-        },
-      });
-    } else {
-      const patientId = uuidv4();
-      entries.push({
-        fullUrl: `urn:uuid:${patientId}`,
-        resource: patient,
-        request: {
-          method: 'POST',
-          url: 'Patient',
-        },
-      });
-    }
+    // Add Patient resource - always POST for CR (CR handles deduplication)
+    const patientId = uuidv4();
+    entries.push({
+      fullUrl: `urn:uuid:${patientId}`,
+      resource: patient,
+      request: {
+        method: 'POST',
+        url: 'Patient',
+      },
+    });
 
     // Add RelatedPerson (mother) if available
     if (relatedPerson) {
@@ -61,24 +51,26 @@ export class BundleBuilder {
 
   /**
    * Create a Shared Health Record (SHR) bundle with clinical data
-   * Sends Encounters, Observations, Conditions
+   * Sends Encounters, Observations, Conditions, and QuestionnaireResponse (audit trail)
    */
   static createSHRBundle(
     encounter: FHIREncounter,
     observations: FHIRObservation[] = [],
-    conditions: FHIRCondition[] = []
+    conditions: FHIRCondition[] = [],
+    questionnaireResponse?: FHIRQuestionnaireResponse
   ): FHIRBundle {
     logger.debug('Building Shared Health Record bundle');
 
     const entries: BundleEntry[] = [];
 
     // Add Encounter resource
+    const encounterHasId = !!encounter.id;
     entries.push({
-      fullUrl: encounter.id ? `Encounter/${encounter.id}` : `urn:uuid:${uuidv4()}`,
+      fullUrl: encounterHasId ? `Encounter/${encounter.id}` : `urn:uuid:${uuidv4()}`,
       resource: encounter,
       request: {
-        method: 'POST',
-        url: 'Encounter',
+        method: encounterHasId ? 'PUT' : 'POST',
+        url: encounterHasId ? `Encounter/${encounter.id}` : 'Encounter',
       },
     });
 
@@ -105,6 +97,18 @@ export class BundleBuilder {
         },
       });
     });
+
+    // Add QuestionnaireResponse for audit trail and complete form documentation
+    if (questionnaireResponse) {
+      entries.push({
+        fullUrl: questionnaireResponse.id ? `QuestionnaireResponse/${questionnaireResponse.id}` : `urn:uuid:${uuidv4()}`,
+        resource: questionnaireResponse,
+        request: {
+          method: 'POST',
+          url: 'QuestionnaireResponse',
+        },
+      });
+    }
 
     const bundle: FHIRBundle = {
       resourceType: 'Bundle',
