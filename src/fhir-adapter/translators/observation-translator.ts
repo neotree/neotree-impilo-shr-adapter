@@ -4,6 +4,7 @@
  */
 
 import type {
+  Extension,
   FHIRObservation,
 } from '../../shared/types/fhir.types';
 import { NeotreePatientData } from '../../shared/types/neotree.types';
@@ -11,6 +12,8 @@ import { extractVitalSigns, extractBodyMeasurements } from '../mappers/neotree-m
 import { getConfig } from '../../shared/config';
 import { getLogger } from '../../shared/utils/logger';
 import { TransformationError } from '../../shared/utils/errors';
+import { getMappingConfigurationService } from '../services/mapping-configuration-service';
+import { FieldMapping } from '../types/mappings.types';
 
 const logger = getLogger('observation-translator');
 
@@ -78,19 +81,23 @@ const APGAR_SCORE_CODE: ObservationCode = {
 
 export class ObservationTranslator {
   private config = getConfig();
+  private mappingService = getMappingConfigurationService();
 
   /**
    * Translate Neotree data to FHIR Observation resources
+   * Now includes both static mappings and dynamic mappings from configuration
    */
   translate(
     data: NeotreePatientData,
     patientReference: string,
-    encounterReference?: string
+    encounterReference?: string,
+    facilityId?: string
   ): FHIRObservation[] {
     try {
       logger.debug({ uid: data.uid }, 'Translating observations to FHIR');
 
       const observations: FHIRObservation[] = [];
+      const resolvedFacilityId = facilityId;
 
       // Add vital signs
       const vitalSigns = extractVitalSigns(data);
@@ -106,7 +113,8 @@ export class ObservationTranslator {
               measurement.value,
               'vital-signs',
               // Use completedAt (when observation was recorded/completed) if available, otherwise admissionDateTime, then dateOfBirth
-              data.completedAt || data.admissionDateTime || data.dateOfBirth
+              data.completedAt || data.admissionDateTime || data.dateOfBirth,
+              resolvedFacilityId
             )
           );
         }
@@ -126,7 +134,8 @@ export class ObservationTranslator {
               measurement.value,
               'vital-signs',
               // Use completedAt for body measurements as well
-              data.completedAt || data.dateOfBirth
+              data.completedAt || data.dateOfBirth,
+              resolvedFacilityId
             )
           );
         }
@@ -140,7 +149,8 @@ export class ObservationTranslator {
             patientReference,
             encounterReference,
             1,
-            data.apgar1
+            data.apgar1,
+            resolvedFacilityId
           )
         );
       }
@@ -152,7 +162,8 @@ export class ObservationTranslator {
             patientReference,
             encounterReference,
             5,
-            data.apgar5
+            data.apgar5,
+            resolvedFacilityId
           )
         );
       }
@@ -164,10 +175,20 @@ export class ObservationTranslator {
             patientReference,
             encounterReference,
             10,
-            data.apgar10
+            data.apgar10,
+            resolvedFacilityId
           )
         );
       }
+
+      // Add dynamically mapped observations from configuration
+      const dynamicObservations = this.translateDynamicMappings(
+        data,
+        patientReference,
+        encounterReference,
+        resolvedFacilityId
+      );
+      observations.push(...dynamicObservations);
 
       logger.debug(
         { uid: data.uid, count: observations.length },
@@ -193,16 +214,15 @@ export class ObservationTranslator {
     code: ObservationCode,
     value: number,
     category: string,
-    effectiveDateTime?: string
+    effectiveDateTime?: string,
+    facilityId?: string
   ): FHIRObservation {
     const observation: FHIRObservation = {
       resourceType: 'Observation',
-      meta: {
-        // source: `${this.config.source.id}/${this.config.source.facilityId}`,
-      },
+      meta: this.buildMeta(facilityId),
       identifier: [
         {
-          system: `urn:oid:${this.config.source.facilityId}:neotree:observation`,
+          system: this.buildObservationIdentifierSystem(facilityId),
           value: `obs-${data.uniqueKey}-${code.loinc}`,
         },
       ],
@@ -240,6 +260,7 @@ export class ObservationTranslator {
         system: 'http://unitsofmeasure.org',
         code: code.ucumCode,
       },
+      extension: this.buildEncounterReferenceExtension(encounterReference),
     };
 
     if (encounterReference) {
@@ -259,16 +280,15 @@ export class ObservationTranslator {
     patientReference: string,
     encounterReference: string | undefined,
     minutes: number,
-    score: number
+    score: number,
+    facilityId?: string
   ): FHIRObservation {
     const observation: FHIRObservation = {
       resourceType: 'Observation',
-      meta: {
-        source: `${this.config.source.id}/${this.config.source.facilityId}`,
-      },
+      meta: this.buildMeta(facilityId),
       identifier: [
         {
-          system: `urn:oid:${this.config.source.facilityId}:neotree:observation`,
+          system: this.buildObservationIdentifierSystem(facilityId),
           value: `obs-${data.uniqueKey}-apgar-${minutes}`,
         },
       ],
@@ -309,6 +329,7 @@ export class ObservationTranslator {
         system: 'http://unitsofmeasure.org',
         code: APGAR_SCORE_CODE.ucumCode,
       },
+      extension: this.buildEncounterReferenceExtension(encounterReference),
     };
 
     if (encounterReference) {
@@ -327,5 +348,273 @@ export class ObservationTranslator {
     const birthTime = new Date(birthDateTime);
     birthTime.setMinutes(birthTime.getMinutes() + minutes);
     return birthTime.toISOString();
+  }
+
+  /**
+   * Translate dynamically mapped observations from configuration
+   * Handles examination findings, additional vitals, laboratory results, etc.
+   */
+  private translateDynamicMappings(
+    data: NeotreePatientData,
+    patientReference: string,
+    encounterReference: string | undefined,
+    facilityId?: string
+  ): FHIRObservation[] {
+    const observations: FHIRObservation[] = [];
+
+    try {
+      // Get all observation mappings from configuration
+      const observationMappings = this.mappingService.getMappingsByResourceType(
+        'Observation',
+        facilityId
+      );
+
+      logger.debug(
+        { uid: data.uid, facilityId, mappingCount: observationMappings.length },
+        'Processing dynamically mapped observations'
+      );
+
+      for (const mapping of observationMappings) {
+        try {
+          // Get the field value from patient data
+          const fieldValue = this.getFieldValue(data, mapping.neotreeKey);
+
+          if (fieldValue === null || fieldValue === undefined) {
+            continue; // Skip empty fields
+          }
+
+          // Skip if it's an empty array
+          if (Array.isArray(fieldValue) && fieldValue.length === 0) {
+            continue;
+          }
+
+          // Handle multi-value fields
+          if (mapping.multiValue && Array.isArray(fieldValue)) {
+            for (const value of fieldValue) {
+              observations.push(
+                this.buildDynamicObservation(
+                  data,
+                  patientReference,
+                  encounterReference,
+                  mapping,
+                  value,
+                  facilityId
+                )
+              );
+            }
+          } else {
+            observations.push(
+              this.buildDynamicObservation(
+                data,
+                patientReference,
+                encounterReference,
+                mapping,
+                fieldValue,
+                facilityId
+              )
+            );
+          }
+
+          logger.debug(
+            { neotreeKey: mapping.neotreeKey, code: mapping.code },
+            'Dynamically mapped observation created'
+          );
+        } catch (error) {
+          logger.warn(
+            {
+              neotreeKey: mapping.neotreeKey,
+              error: error instanceof Error ? error.message : String(error),
+            },
+            'Failed to create dynamic observation'
+          );
+        }
+      }
+
+      return observations;
+    } catch (error) {
+      logger.error(
+        { error: error instanceof Error ? error.message : String(error) },
+        'Error processing dynamic mappings'
+      );
+      return [];
+    }
+  }
+
+  /**
+   * Build a dynamically mapped observation from configuration
+   */
+  private buildDynamicObservation(
+    data: NeotreePatientData,
+    patientReference: string,
+    encounterReference: string | undefined,
+    mapping: FieldMapping,
+    value: unknown,
+    facilityId?: string
+  ): FHIRObservation {
+    const categorySystem = mapping.categorySystem || 'http://terminology.hl7.org/CodeSystem/observation-category';
+    const categoryCode = mapping.categoryCode || mapping.observationCategory || 'exam-finding';
+    const categoryDisplay = mapping.categoryDisplay || this.getCategoryDisplay(mapping.observationCategory || 'exam-finding');
+
+    const observation: FHIRObservation = {
+      resourceType: 'Observation',
+      meta: this.buildMeta(facilityId),
+      identifier: [
+        {
+          system: this.buildObservationIdentifierSystem(facilityId),
+          value: `obs-${data.uniqueKey}-${mapping.code || mapping.neotreeKey}`,
+        },
+      ],
+      status: 'final',
+      category: [
+        {
+          coding: [
+            {
+              system: categorySystem,
+              code: categoryCode,
+              display: categoryDisplay,
+            },
+          ],
+        },
+      ],
+      code: {
+        coding: [
+          {
+            system: mapping.codeSystem || 'http://snomed.info/sct',
+            code: mapping.code || mapping.neotreeKey,
+            display: mapping.codeDisplay || mapping.neotreeDisplayName || mapping.neotreeKey,
+          },
+        ],
+        text: mapping.neotreeDisplayName || mapping.neotreeKey,
+      },
+      subject: {
+        reference: patientReference,
+      },
+      effectiveDateTime: data.completedAt
+        ? new Date(data.completedAt).toISOString()
+        : data.admissionDateTime
+        ? new Date(data.admissionDateTime).toISOString()
+        : data.dateOfBirth
+        ? new Date(data.dateOfBirth).toISOString()
+        : undefined,
+      extension: this.buildEncounterReferenceExtension(encounterReference),
+    };
+
+    // Set value based on data type
+    if (mapping.fhirDataType === 'quantity' && typeof value === 'number') {
+      observation.valueQuantity = {
+        value: value,
+        unit: mapping.unit || '',
+        system: 'http://unitsofmeasure.org',
+        code: mapping.ucumCode || mapping.unit || '',
+      };
+    } else if (mapping.fhirDataType === 'boolean') {
+      observation.valueBoolean = this.parseBoolean(value, mapping.valueMapping);
+    } else if (mapping.fhirDataType === 'code' || mapping.fhirDataType === 'codeableconcept') {
+      observation.valueCodeableConcept = {
+        coding: [
+          {
+            system: mapping.codeSystem || 'http://snomed.info/sct',
+            code: String(value),
+            display: String(value),
+          },
+        ],
+      };
+    } else {
+      observation.valueString = String(value);
+    }
+
+    if (encounterReference) {
+      observation.encounter = {
+        reference: encounterReference,
+      };
+    }
+
+    return observation;
+  }
+
+  private buildMeta(facilityId?: string): { source?: string; tag?: { system?: string; code?: string }[] } | undefined {
+    const sourceId = this.config.source.id;
+    const meta: { source?: string; tag?: { system?: string; code?: string }[] } = {};
+
+    if (sourceId) {
+      meta.source = sourceId;
+    }
+
+    if (facilityId) {
+      meta.tag = [
+        {
+          system: 'http://openclientregistry.org/fhir/clientid',
+          code: facilityId,
+        },
+      ];
+    }
+
+    return meta.source || meta.tag ? meta : undefined;
+  }
+
+  private buildObservationIdentifierSystem(facilityId?: string): string | undefined {
+    if (!facilityId) {
+      return undefined;
+    }
+    return `urn:oid:${facilityId}:neotree:observation`;
+  }
+
+  private buildEncounterReferenceExtension(encounterReference?: string): Extension[] | undefined {
+    if (!encounterReference) {
+      return undefined;
+    }
+
+    return [
+      {
+        url: 'urn:neotree:neonatal-care-reference',
+        valueReference: {
+          reference: encounterReference,
+        },
+      },
+    ];
+  }
+
+  /**
+   * Get field value from patient data by key
+   */
+  private getFieldValue(data: NeotreePatientData, key: string): unknown {
+    const value = (data as unknown as Record<string, unknown>)[key];
+    return value;
+  }
+
+  /**
+   * Parse boolean value with optional value mapping
+   */
+  private parseBoolean(value: unknown, valueMapping?: Record<string, string>): boolean {
+    if (typeof value === 'boolean') {
+      return value;
+    }
+
+    if (valueMapping) {
+      const mapped = valueMapping[String(value)];
+      if (mapped !== undefined) {
+        return mapped === 'true' || mapped === '1' || mapped === 'True';
+      }
+    }
+
+    const str = String(value).toLowerCase();
+    return str === 'true' || str === 'y' || str === '1' || str === 'yes';
+  }
+
+  /**
+   * Get display name for observation category
+   */
+  private getCategoryDisplay(category: string): string {
+    const displayMap: Record<string, string> = {
+      'vital-signs': 'Vital Signs',
+      'exam-finding': 'Exam Finding',
+      'imaging': 'Imaging',
+      'laboratory': 'Laboratory',
+      'procedure': 'Procedure',
+      'survey': 'Survey',
+      'therapy': 'Therapy',
+      'activity': 'Activity',
+    };
+    return displayMap[category] || category;
   }
 }

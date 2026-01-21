@@ -8,19 +8,22 @@
 import * as cron from 'node-cron';
 import { getPool } from '../../shared/database/pool';
 import { AdapterService } from './adapter-service';
+import { DBDecryptionService } from './db-decryption-service';
 import { getLogger } from '../../shared/utils/logger';
+import { getJsonFileLogger } from '../../shared/utils/json-file-logger';
 import { getConfig } from '../../shared/config';
 import { NeotreeEntry } from '../../shared/types/neotree.types';
 
 const logger = getLogger('cdc-service');
+const jsonLogger = getJsonFileLogger();
 
 interface CDCRecord {
-  id: string;
+  id: bigint;
   ingested_at: Date;
-  session_time: Date;  // Changed from time to session_time
+  session_time: Date;  // Event time/encounter time from source
   impilo_uid?: string;
-  impilo_id?: string;
-  data: Record<string, unknown>;
+  impilo_id?: string;  // Encrypted AES-256-CBC value or plain text UUID
+  data: string;  // JSON string (can be encrypted AES-256-CBC or plain JSON)
 }
 
 interface FailedRecord {
@@ -40,7 +43,7 @@ interface FailedRecord {
 export class CDCService {
   private adapterService: AdapterService;
   private isPolling = false;
-  private pollCronSchedule = '*/30 * * * * *'; // Every 30 seconds
+  private pollCronSchedule = '*/5 * * * * *'; // Every 5 seconds
   private retryCronSchedule = '*/5 * * * *'; // Every 5 minutes
   private pollTask: cron.ScheduledTask | null = null;
   private retryTask: cron.ScheduledTask | null = null;
@@ -64,7 +67,7 @@ export class CDCService {
       throw error;
     }
 
-    // Schedule polling task (every 30 seconds)
+    // Schedule polling task (every 5 seconds)
     this.pollTask = cron.schedule(this.pollCronSchedule, () => {
       void this.pollForNewSessions();
     });
@@ -74,7 +77,7 @@ export class CDCService {
       void this.retryFailedSessions();
     });
 
-    logger.info('CDC service started with cron scheduler - poll: 30s, retry: 5m');
+    logger.info('CDC service started with cron scheduler - poll: 5s, retry: 5m');
   }
 
   /**
@@ -115,33 +118,132 @@ export class CDCService {
   }
 
   private async processBatch(records: CDCRecord[]): Promise<void> {
+    const batchStartTime = Date.now();
     let successCount = 0;
+    let crSuccessCount = 0;
+    let shrSuccessCount = 0;
     let failureCount = 0;
+    let partialFailures = 0;
 
     for (const record of records) {
       let crSynced = false;
       let shrSynced = false;
+      let decryptedData: Record<string, unknown> | null = null;
+      let decryptedImpiloId: string | null = null;
+      let encryptedImpiloId: string | null = null;
+      let encryptedDataStr: string | null = null;
+
       try {
-        const entry = this.convertToNeotreeEntry(record.data, record.impilo_uid);
-        
-        // Phase 1: CR Push
+        // Step 1: Decrypt encrypted columns from DB_SOURCE_TABLE if present
+        if (
+          record.impilo_id &&
+          typeof record.impilo_id === 'string' &&
+          DBDecryptionService.isEncrypted(record.impilo_id)
+        ) {
+          try {
+            logger.debug({ sessionId: record.id }, 'Decrypting impilo_id and data from DB_SOURCE_TABLE');
+            encryptedImpiloId = record.impilo_id;
+            encryptedDataStr = record.data;  // Already a string from the database
+
+            const decryptedRecord = DBDecryptionService.decryptDBRecord(
+              encryptedImpiloId,
+              encryptedDataStr
+            );
+            decryptedImpiloId = decryptedRecord.impiloId;
+            decryptedData = decryptedRecord.data;
+            logger.debug({ sessionId: record.id }, 'Successfully decrypted DB_SOURCE_TABLE record');
+          } catch (decryptError) {
+            logger.error(
+              { sessionId: record.id, error: decryptError instanceof Error ? decryptError.message : String(decryptError) },
+              'Failed to decrypt DB_SOURCE_TABLE record - storing encrypted in failed table'
+            );
+            // Record as failure with encrypted data preserved
+            await this.recordFailureWithEncryptedData(record, decryptError, encryptedImpiloId, encryptedDataStr);
+            failureCount++;
+            continue;
+          }
+        } else {
+          // Data is already decrypted or plain - parse JSON string
+          decryptedData = JSON.parse(record.data);
+          decryptedImpiloId = record.impilo_uid || null;
+        }
+
+        // Step 2: Validate decrypted data before conversion
+        if (!decryptedData || typeof decryptedData !== 'object') {
+          throw new Error('Invalid decrypted data: missing or not an object');
+        }
+
+        // Step 3: Convert to NeotreeEntry
+        const entry = this.convertToNeotreeEntry(decryptedData as Record<string, unknown>, decryptedImpiloId || undefined);
+
+        // Phase 1: CR Push (with dual-flow that can fail partially)
         try {
-          logger.info({ sessionId: record.id }, 'Phase 1: Pushing demographics to CR');
-          // We'll use a modified dual flow that can track progress
-          await this.adapterService.processEntryWithDualFlow(entry);
-          crSynced = true;
-          shrSynced = true; // If processEntryWithDualFlow returns, both succeeded in original impl
-          successCount++;
-          logger.info({ sessionId: record.id }, 'Successfully processed session with dual-flow (CR + SHR)');
-        } catch (dualError) {
-          // If it fails, we need to know how far it got. 
-          // For now, if it throws, we record failure but our recordFailure now supports tracking
+          logger.info({ sessionId: record.id }, 'Phase 1: Pushing demographics to CR with dual-flow');
+
+          try {
+            await this.adapterService.processEntryWithDualFlow(entry);
+            crSynced = true;
+            shrSynced = true;
+            crSuccessCount++;
+            shrSuccessCount++;
+            successCount++;
+            logger.info({ sessionId: record.id }, 'Successfully processed session with dual-flow (CR + SHR)');
+          } catch (dualFlowError) {
+            // The error might have come from CR or SHR. Since processEntryWithDualFlow doesn't distinguish,
+            // we attempt to determine which phase failed based on error context.
+            const errorMsg = dualFlowError instanceof Error ? dualFlowError.message : String(dualFlowError);
+            const errorContext = JSON.stringify(dualFlowError);
+            const errorContextData = (dualFlowError as { context?: { crSynced?: boolean; shrSynced?: boolean } })?.context;
+
+            if (errorContextData?.crSynced) {
+              crSynced = true;
+              shrSynced = errorContextData.shrSynced === true;
+              crSuccessCount++;
+              logger.warn(
+                { sessionId: record.id, error: errorMsg },
+                'Phase 1 Partial Success: CR succeeded, SHR failed (context provided)'
+              );
+            } else if (
+              errorMsg.includes('Patient not found') ||
+              errorMsg.includes('link clinical data') ||
+              errorMsg.includes('Cannot link clinical data')
+            ) {
+              // This is likely an SHR error after CR succeeded
+              crSynced = true;
+              shrSynced = false;
+              crSuccessCount++;
+              logger.warn(
+                { sessionId: record.id, error: errorMsg },
+                'Phase 1 Partial Success: CR succeeded, SHR failed (will retry in Phase 2)'
+              );
+            } else {
+              // CR push itself failed (or an earlier phase failed)
+              crSynced = false;
+              shrSynced = false;
+              logger.error(
+                { sessionId: record.id, error: errorMsg, errorContext: errorContext.substring(0, 500) },
+                'Phase 1 Failed: CR push failed'
+              );
+            }
+
+            failureCount++;
+            if (crSynced && !shrSynced) {
+              partialFailures++;
+            }
+
+            // Record failure with proper CR/SHR status tracking
+            await this.recordFailureWithStatus(record, dualFlowError, crSynced, shrSynced, encryptedImpiloId, encryptedDataStr);
+          }
+        } catch (error) {
           failureCount++;
-          await this.recordFailureWithStatus(record, dualError, crSynced, shrSynced);
+          logger.error({ sessionId: record.id, error: error instanceof Error ? error.message : String(error) }, 'Unexpected error during dual-flow processing');
+          // Store encrypted data if it was encrypted, otherwise store decrypted
+          await this.recordFailureWithStatus(record, error, crSynced, shrSynced, encryptedImpiloId, encryptedDataStr);
         }
       } catch (error) {
         failureCount++;
-        await this.recordFailureWithStatus(record, error, crSynced, shrSynced);
+        // Store encrypted data if it was encrypted, otherwise store decrypted
+        await this.recordFailureWithStatus(record, error, crSynced, shrSynced, encryptedImpiloId, encryptedDataStr);
         logger.error({ sessionId: record.id, error: error instanceof Error ? error.message : String(error) }, 'Failed to convert or process session');
       }
     }
@@ -151,7 +253,26 @@ export class CDCService {
       await this.updateWatermark(lastRecord.ingested_at, lastRecord.id, records.length);
     }
 
-    logger.info({ total: records.length, success: successCount, failed: failureCount }, 'Batch completed');
+    const batchDurationMs = Date.now() - batchStartTime;
+
+    // Log batch processing statistics
+    jsonLogger.logBatchProcess({
+      timestamp: new Date().toISOString(),
+      operation: 'batch_process',
+      batchSize: records.length,
+      successCount,
+      crSuccessCount,
+      shrSuccessCount,
+      failureCount,
+      partialFailures,
+      durationMs: batchDurationMs,
+      details: {
+        averageTimePerRecord: batchDurationMs / records.length,
+        successRate: `${((successCount / records.length) * 100).toFixed(2)}%`,
+      },
+    });
+
+    logger.info({ total: records.length, success: successCount, failed: failureCount, durationMs: batchDurationMs }, 'Batch completed');
   }
 
   /**
@@ -159,7 +280,7 @@ export class CDCService {
    */
   private async updateWatermark(
     ingestedAt: Date,
-    sessionId: string,
+    sessionId: bigint,
     count: number
   ): Promise<void> {
     try {
@@ -175,13 +296,52 @@ export class CDCService {
 
   /**
    * Record failed session for retry
-   * Uses original 'time' timestamp from session, not ingested_at
+   * Uses original 'session_time' timestamp from session
+   * Stores encrypted data if it was encrypted, otherwise stores original data
    */
   private async recordFailureWithStatus(
     record: CDCRecord,
     error: unknown,
     crSynced = false,
-    shrSynced = false
+    shrSynced = false,
+    encryptedImpiloId: string | null = null,
+    encryptedData: string | null = null
+  ): Promise<void> {
+    try {
+      const pool = getPool();
+      const errorMessage = error instanceof Error ? error.message : String(error);
+
+      // Store encrypted data if available, otherwise use original
+      const impiloIdToStore = encryptedImpiloId || record.impilo_id || null;
+      const dataToStore = encryptedData || JSON.stringify(record.data);
+
+      await pool.query(
+        'SELECT record_failed_session($1, $2, $3, $4, $5, $6, $7, $8, $9)',
+        [
+          record.id,
+          record.session_time, // Event time/encounter time from source
+          errorMessage,
+          impiloIdToStore,
+          dataToStore,
+          crSynced && shrSynced, // overall synced
+          crSynced,
+          shrSynced,
+          record.impilo_uid || null,
+        ]
+      );
+    } catch (err) {
+      logger.error({ error: err }, 'Failed to record failure');
+    }
+  }
+
+  /**
+   * Record failed session with encrypted data that failed to decrypt
+   */
+  private async recordFailureWithEncryptedData(
+    record: CDCRecord,
+    error: unknown,
+    encryptedImpiloId: string | null,
+    encryptedData: string | null
   ): Promise<void> {
     try {
       const pool = getPool();
@@ -191,18 +351,18 @@ export class CDCService {
         'SELECT record_failed_session($1, $2, $3, $4, $5, $6, $7, $8, $9)',
         [
           record.id,
-          record.session_time, // Use session_time instead of time
+          record.session_time,
           errorMessage,
-          record.impilo_id || null,
-          JSON.stringify(record.data),
-          crSynced && shrSynced, // overall synced
-          crSynced,
-          shrSynced,
+          encryptedImpiloId,
+          encryptedData,
+          false, // synced=false
+          false, // cr_synced=false
+          false, // shr_synced=false
           record.impilo_uid || null,
         ]
       );
     } catch (err) {
-      logger.error({ error: err }, 'Failed to record failure');
+      logger.error({ error: err }, 'Failed to record encrypted failure');
     }
   }
 
@@ -225,6 +385,10 @@ export class CDCService {
   }
 
   private async retryBatch(records: FailedRecord[]): Promise<void> {
+    const batchStartTime = Date.now();
+    let successCount = 0;
+    let failureCount = 0;
+
     for (const record of records) {
       try {
         // Map FailedRecord to FailedSyncRecord for the adapter service
@@ -236,11 +400,35 @@ export class CDCService {
         };
 
         await this.adapterService.processSyncedEntry(syncRecord);
+        successCount++;
         logger.info({ sessionId: record.session_id }, 'Retry successful');
       } catch (error) {
+        failureCount++;
         logger.warn({ sessionId: record.session_id, error: error instanceof Error ? error.message : String(error) }, 'Retry failed');
       }
     }
+
+    const batchDurationMs = Date.now() - batchStartTime;
+
+    // Log retry batch statistics
+    jsonLogger.logBatchProcess({
+      timestamp: new Date().toISOString(),
+      operation: 'batch_process',
+      batchSize: records.length,
+      successCount,
+      crSuccessCount: successCount, // Assumption: retry is for both CR and SHR
+      shrSuccessCount: successCount,
+      failureCount,
+      partialFailures: 0,
+      durationMs: batchDurationMs,
+      details: {
+        type: 'retry_batch',
+        averageTimePerRecord: records.length > 0 ? batchDurationMs / records.length : 0,
+        successRate: records.length > 0 ? `${((successCount / records.length) * 100).toFixed(2)}%` : '0%',
+      },
+    });
+
+    logger.info({ total: records.length, success: successCount, failed: failureCount, durationMs: batchDurationMs }, 'Retry batch completed');
   }
 
   /**

@@ -11,7 +11,7 @@ import { getLogger } from '../shared/utils/logger';
 import { getConfig } from '../shared/config';
 import { AdapterError } from '../shared/utils/errors';
 import { NeotreeEntry } from '../shared/types/neotree.types';
-import { testConnection, closePool } from '../shared/database/pool';
+import { testConnection, closePool, ensureCrPatientLinksTable } from '../shared/database/pool';
 
 const logger = getLogger('fhir-adapter-api');
 
@@ -207,6 +207,7 @@ class FHIRAdapterAPI {
     if (!dbHealthy) {
       throw new Error('Database connection failed. Check your .pgpass file or DB_PASSWORD env var.');
     }
+    await ensureCrPatientLinksTable();
 
     // Start CDC service
     await this.cdcService.start();

@@ -9,37 +9,49 @@ import type {
   Identifier,
 } from '../../shared/types/fhir.types';
 import { NeotreePatientData } from '../../shared/types/neotree.types';
-import { getConfig } from '../../shared/config';
 import { TransformationError } from '../../shared/utils/errors';
+import { getLogger } from '../../shared/utils/logger';
+
+const logger = getLogger('patient-translator');
 
 export class PatientTranslator {
-  private config = getConfig();
-
-  translate(data: NeotreePatientData): FHIRPatient {
-    console.log("...............OOOO---",data)
+  translate(data: NeotreePatientData, facilityId?: string): FHIRPatient {
     try {
+      logger.debug({ uid: data.uid }, 'Translating patient to FHIR');
+      const resolvedFacilityId = facilityId;
       const patient: FHIRPatient = {
         resourceType: 'Patient',
-        meta: {
-          tag: [
-            {
-              system: 'http://openclientregistry.org/fhir/clientid',
-              code: this.config.source.facilityId,
-            },
-          ],
-        },
         identifier: this.buildIdentifiers(data),
         name: this.buildNames(data),
         gender: (data.gender as 'male' | 'female' | 'other' | 'unknown') || 'unknown',
         birthDate: this.extractDate(data.dateOfBirth),
-        managingOrganization: {
-          reference: `Organization/${this.config.source.facilityId}`,
-        },
       };
+
+      if (resolvedFacilityId) {
+        patient.meta = {
+          tag: [
+            {
+              system: 'http://openclientregistry.org/fhir/clientid',
+              code: resolvedFacilityId,
+            },
+          ],
+        };
+        patient.managingOrganization = {
+          reference: `Organization/${resolvedFacilityId}`,
+        };
+      }
 
       if (!patient.birthDate) {
         delete patient.birthDate;
       }
+
+      // Add maternal information as extensions (for CR persistence, will be reference in SHR)
+      this.addMaternalExtensions(patient, data);
+
+      logger.info(
+        { uid: data.uid, facilityId, identifierCount: patient.identifier?.length },
+        'Patient resource translated successfully'
+      );
 
       return patient;
     } catch (error) {
@@ -54,8 +66,9 @@ export class PatientTranslator {
    * Build patient identifiers
    * Priority order (per FHIR mapping documentation):
    * 1. Primary: impilo_neotree_id → urn:neotree:impilo-id
-   * 2. Secondary: patient_id → urn:impilo:uid
+   * 2. Secondary: impilo_uid → urn:impilo:uid
    * 3. Tertiary: person_id → urn:impilo:person-id (facility-specific, nfor)
+   *    - Falls back to impilo_uid if person_id not provided
    */
   private buildIdentifiers(data: NeotreePatientData): Identifier[] {
     const identifiers: Identifier[] = [];
@@ -75,10 +88,12 @@ export class PatientTranslator {
     }
 
     // Tertiary identifier: Person ID (facility-specific, nfor)
-    if (data.person_id) {
+    // Falls back to impilo_uid if person_id not provided
+    const personId = data.person_id || data.impilo_uid;
+    if (personId) {
       identifiers.push({
         system: 'urn:impilo:person-id',
-        value: data.person_id,
+        value: personId,
       });
     }
 
@@ -134,6 +149,96 @@ export class PatientTranslator {
       return date.toISOString().split('T')[0];
     } catch {
       return undefined;
+    }
+  }
+
+  /**
+   * Add maternal information as extensions to Patient resource
+   * Stores key maternal data that informs interpretation of baby's clinical data
+   * Note: Mother's identifiable information (name, DOB) is stored in RelatedPerson
+   */
+  private addMaternalExtensions(patient: FHIRPatient, data: NeotreePatientData): void {
+    const extensions: any[] = [];
+
+    // Maternal age at delivery
+    if (data.motherAgeYears !== undefined && data.motherAgeYears !== null) {
+      extensions.push({
+        url: 'http://hl7.org/fhir/StructureDefinition/patient-maternalAge',
+        valueQuantity: {
+          value: data.motherAgeYears,
+          unit: 'years',
+          system: 'http://unitsofmeasure.org',
+          code: 'a',
+        },
+      });
+    }
+
+    // Maternal HIV status (critical for PMTCT interpretation)
+    if (data.motherHIVStatus) {
+      extensions.push({
+        url: 'http://hl7.org/fhir/StructureDefinition/patient-motherHIVStatus',
+        valueCodeableConcept: {
+          coding: [
+            {
+              system: 'http://snomed.info/sct',
+              code: data.motherHIVStatus === 'Positive' ? '165816005' : '165815004',
+              display: data.motherHIVStatus,
+            },
+          ],
+        },
+      });
+    }
+
+    // Gestational age (critical for prematurity interpretation)
+    if (data.gestation !== undefined && data.gestation !== null) {
+      extensions.push({
+        url: 'http://hl7.org/fhir/StructureDefinition/patient-maternalGestationalAge',
+        valueQuantity: {
+          value: data.gestation,
+          unit: 'weeks',
+          system: 'http://unitsofmeasure.org',
+          code: 'wk',
+        },
+      });
+    }
+
+    // Mode of delivery (affects risk of complications)
+    if (data.modeOfDelivery) {
+      extensions.push({
+        url: 'http://hl7.org/fhir/StructureDefinition/patient-modeOfDelivery',
+        valueCodeableConcept: {
+          coding: [
+            {
+              system: 'http://snomed.info/sct',
+              code: data.modeOfDelivery,
+              display: data.modeOfDelivery,
+            },
+          ],
+        },
+      });
+    }
+
+    // Apgar scores (important baseline status indicators)
+    if (data.apgar1 !== undefined && data.apgar1 !== null) {
+      extensions.push({
+        url: 'http://hl7.org/fhir/StructureDefinition/patient-apgarScore1Minute',
+        valueInteger: data.apgar1,
+      });
+    }
+    if (data.apgar5 !== undefined && data.apgar5 !== null) {
+      extensions.push({
+        url: 'http://hl7.org/fhir/StructureDefinition/patient-apgarScore5Minute',
+        valueInteger: data.apgar5,
+      });
+    }
+
+    // Add extensions to patient if any were created
+    if (extensions.length > 0) {
+      (patient as any).extension = extensions;
+      logger.debug(
+        { uid: data.uid, extensionCount: extensions.length },
+        'Added maternal information extensions to Patient'
+      );
     }
   }
 }

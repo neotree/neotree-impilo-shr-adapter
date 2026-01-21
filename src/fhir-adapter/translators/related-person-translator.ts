@@ -10,19 +10,21 @@ import type {
   CodeableConcept,
 } from '../../shared/types/fhir.types';
 import { NeotreePatientData } from '../../shared/types/neotree.types';
-import { getConfig } from '../../shared/config';
 import { getLogger } from '../../shared/utils/logger';
 import { TransformationError } from '../../shared/utils/errors';
 
 const logger = getLogger('related-person-translator');
 
 export class RelatedPersonTranslator {
-  private config = getConfig();
-
   /**
    * Translate Neotree mother data to FHIR RelatedPerson resource
    */
-  translate(data: NeotreePatientData, patientReference: string): FHIRRelatedPerson | null {
+  translate(
+    data: NeotreePatientData,
+    patientReference: string,
+    facilityId?: string,
+    sourceId?: string
+  ): FHIRRelatedPerson | null {
     if (!data.motherFirstName && !data.motherSurname) {
       logger.debug({ uid: data.uid }, 'No mother information available, skipping RelatedPerson');
       return null;
@@ -33,10 +35,12 @@ export class RelatedPersonTranslator {
 
       const relatedPerson: FHIRRelatedPerson = {
         resourceType: 'RelatedPerson',
-        meta: {
-          source: `${this.config.source.id}/${this.config.source.facilityId}`,
-        },
-        identifier: this.buildIdentifiers(data),
+        meta: sourceId
+          ? {
+              source: facilityId ? `${sourceId}/${facilityId}` : sourceId,
+            }
+          : undefined,
+        identifier: this.buildIdentifiers(data, facilityId),
         active: true,
         patient: {
           reference: patientReference,
@@ -61,7 +65,7 @@ export class RelatedPersonTranslator {
   /**
    * Build mother identifiers
    */
-  private buildIdentifiers(data: NeotreePatientData): Identifier[] {
+  private buildIdentifiers(data: NeotreePatientData, facilityId?: string): Identifier[] {
     const identifiers: Identifier[] = [];
 
     // Mother identifier based on baby's UID
@@ -77,7 +81,9 @@ export class RelatedPersonTranslator {
         ],
         text: 'Mother Identifier',
       },
-      system: `http://health.gov.zw/fhir/identifiers/${this.config.source.facilityId}/mother`,
+      system: facilityId
+        ? `http://health.gov.zw/fhir/identifiers/${facilityId}/mother`
+        : undefined,
       value: `mother-of-${data.uid}`,
     });
 

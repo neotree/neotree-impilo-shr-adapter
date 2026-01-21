@@ -1,5 +1,5 @@
 import { NeotreeEntry } from '../../shared/types/neotree.types';
-import { FHIRBundle } from '../../shared/types/fhir.types';
+import { FHIRBundle, FHIRPatient, FHIRResource } from '../../shared/types/fhir.types';
 import { mapNeotreeToPatientData } from '../mappers/neotree-mapper';
 import { PatientTranslator } from '../translators/patient-translator';
 import { EncounterTranslator } from '../translators/encounter-translator';
@@ -14,11 +14,13 @@ import { DBDecryptionService } from './db-decryption-service';
 import { FacilityIdGenerator } from '../utils/facility-id-generator';
 import { getLogger } from '../../shared/utils/logger';
 import { getJsonFileLogger } from '../../shared/utils/json-file-logger';
-import { handleError } from '../../shared/utils/errors';
+import { AdapterError, handleError } from '../../shared/utils/errors';
 import { validateAllResources } from '../utils/validation';
 import { DuplicateDetectionService } from './duplicate-detection-service';
 import { MissingDataHandler } from './missing-data-handler';
 import { Pool } from 'pg';
+import { getPool } from '../../shared/database/pool';
+import { v4 as uuidv4 } from 'uuid';
 import { getConfig } from '../../shared/config';
 
 const logger = getLogger('adapter-service');
@@ -38,7 +40,15 @@ export interface FailedSyncRecord {
   shr_synced: boolean;
 }
 
+interface SHRPushResult {
+  resourceType: string;
+  id?: string;
+  status: number;
+  endpoint: string;
+}
+
 export class AdapterService {
+  private config = getConfig();
   private openhimClient: OpenHIMClient;
   private patientTranslator: PatientTranslator;
   private encounterTranslator: EncounterTranslator;
@@ -60,7 +70,52 @@ export class AdapterService {
     this.questionnaireResponseTranslator = new QuestionnaireResponseTranslator();
     this.duplicateDetection = new DuplicateDetectionService();
     this.missingDataHandler = new MissingDataHandler();
-    this.pool = new Pool(getConfig().database);
+    this.pool = getPool();
+  }
+
+  private async pushShrResources(
+    resources: FHIRResource[],
+    context: { uid: string; impiloUid?: string }
+  ): Promise<SHRPushResult[]> {
+    const results: SHRPushResult[] = [];
+
+    for (const resource of resources) {
+      if (!resource) {
+        continue;
+      }
+
+      try {
+        const response = await this.openhimClient.sendResourceToSHR(resource);
+        results.push({
+          resourceType: response.resource.resourceType || resource.resourceType,
+          id: response.resource.id || resource.id,
+          status: response.status,
+          endpoint: response.endpoint,
+        });
+      } catch (error) {
+        logger.error(
+          {
+            uid: context.uid,
+            impiloUid: context.impiloUid,
+            resourceType: resource.resourceType,
+            resourceId: resource.id,
+            error: error instanceof Error ? error.message : String(error),
+          },
+          'Failed to send SHR resource'
+        );
+        throw error;
+      }
+    }
+
+    return results;
+  }
+
+  private async logShrPatientRecord(
+    patientReference: string,
+    context: { uid?: string; impiloId?: string; impiloUid?: string }
+  ): Promise<void> {
+    void patientReference;
+    void context;
   }
 
   /**
@@ -125,9 +180,12 @@ export class AdapterService {
       let patientData;
       if (typeof decryptedData === 'object' && decryptedData !== null && 'script' in decryptedData) {
         neotreeEntry = decryptedData as NeotreeEntry;
-        patientData = mapNeotreeToPatientData(neotreeEntry);
+        patientData = mapNeotreeToPatientData(neotreeEntry, facilityId || undefined);
       } else {
         patientData = decryptedData as unknown;
+      }
+      if (facilityId) {
+        (patientData as { facilityId?: string }).facilityId = facilityId;
       }
 
       // Step 4: Phase 1 - Client Registry (if not already synced)
@@ -157,7 +215,12 @@ export class AdapterService {
             }
           }
 
-          const relatedPerson = this.relatedPersonTranslator.translate(patientData as any, `Patient/${finalPatient.id || 'new'}`);
+          const relatedPerson = this.relatedPersonTranslator.translate(
+            patientData as any,
+            `Patient/${finalPatient.id || 'new'}`,
+            facilityId || undefined,
+            this.config.source.id
+          );
           const crBundle = BundleBuilder.createCRBundle(finalPatient, relatedPerson);
           await this.openhimClient.sendBundleToCR(crBundle);
           
@@ -194,37 +257,46 @@ export class AdapterService {
             }
           }
 
-          // Fallback to uid if impilo_id search failed
-          if (!crResponse) {
-            const neotreeIdentifier = (patientData as any).uid;
-            logger.debug({ recordId: record.id, uid: neotreeIdentifier }, 'Searching for patient in CR using uid');
-            crResponse = await this.openhimClient.getPatientFromCR(neotreeIdentifierSystem, neotreeIdentifier);
-          }
+      // Fallback to uid if impilo_id search failed
+      if (!crResponse) {
+        const neotreeIdentifier = (patientData as any).uid;
+        logger.debug({ recordId: record.id, uid: neotreeIdentifier }, 'Searching for patient in CR using uid');
+        crResponse = await this.openhimClient.getPatientFromCR(neotreeIdentifierSystem, neotreeIdentifier);
+      }
 
-          if (!crResponse || !crResponse.bundleId) {
-            throw new Error('Cannot link clinical data: Patient bundle not found in CR');
-          }
+      if (!crResponse || !crResponse.bundleId) {
+        const cachedBundleId = await this.getCachedCrBundleId(decryptedImpiloId, (patientData as any).uid);
+        if (cachedBundleId) {
+          logger.warn(
+            { recordId: record.id, bundleId: cachedBundleId },
+            'CR lookup failed, using cached bundleId for SHR linkage'
+          );
+          crResponse = { bundleId: cachedBundleId };
+        }
+      }
+
+      if (!crResponse || !crResponse.bundleId) {
+        throw new Error('Cannot link clinical data: Patient bundle not found in CR');
+      }
+      await this.storeCrBundleId(decryptedImpiloId, (patientData as any).uid, crResponse.bundleId);
 
           // ===== SHARED HEALTH RECORD FLOW - PHASE 1: SHALLOW PATIENT =====
           // Post shallow patient record to SHR before sending clinical data
+          let shrPatientId: string | undefined;
           try {
-            if (crResponse.patient) {
-              const shallowPatient = this.createShallowPatientFromCR(crResponse.patient);
-              logger.debug(
-                { recordId: record.id, bundleId: crResponse.bundleId },
-                'Creating shallow patient for SHR'
-              );
-              await this.openhimClient.sendShallowPatientToSHR(shallowPatient);
-              logger.info(
-                { recordId: record.id, bundleId: crResponse.bundleId, endpoint: '/SHR/fhir/Patient' },
-                'Shallow patient posted successfully to SHR'
-              );
-            } else {
-              logger.debug(
-                { recordId: record.id },
-                'No patient data available from CR, skipping shallow patient POST to SHR'
-              );
-            }
+            const shallowPatient = crResponse.patient
+              ? this.createShallowPatientFromCR(crResponse.patient)
+              : this.createShallowPatientFromEntry(patientData, crResponse.bundleId, facilityId || undefined);
+            logger.debug(
+              { recordId: record.id, bundleId: crResponse.bundleId },
+              'Creating shallow patient for SHR'
+            );
+            const shrPatient = await this.openhimClient.sendShallowPatientToSHR(shallowPatient);
+            shrPatientId = shrPatient?.id;
+            logger.info(
+              { recordId: record.id, bundleId: crResponse.bundleId, shrPatientId, endpoint: '/SHR/fhir/Patient' },
+              'Shallow patient posted successfully to SHR'
+            );
           } catch (error) {
             logger.warn(
               { recordId: record.id, error: error instanceof Error ? error.message : String(error) },
@@ -234,20 +306,50 @@ export class AdapterService {
           }
 
           // ===== SHARED HEALTH RECORD FLOW - PHASE 2: CLINICAL DATA =====
-          const patientReference = `Patient/${crResponse.bundleId}`;
-          const encounterReference = `Encounter/${neotreeEntry?.uid}`;
+          const patientReference = `Patient/${shrPatientId || crResponse.bundleId}`;
+          const encounterId = uuidv4();
+          const encounterReference = `Encounter/${encounterId}`;
           const scriptId = (patientData as any).scriptId;
-          const encounter = this.encounterTranslator.translate(patientData as any, patientReference, scriptId);
-          const observations = this.observationTranslator.translate(patientData as any, patientReference, encounterReference);
-          const conditions = this.conditionTranslator.translate(patientData as any, patientReference, encounterReference);
+          const facilityIdFromManagingOrg = this.extractFacilityIdFromManagingOrganization(crResponse.patient);
+          const resolvedFacilityId = facilityId || facilityIdFromManagingOrg;
+          if (!resolvedFacilityId) {
+            throw new Error('Cannot push SHR resources: missing facilityId for Questionnaire reference');
+          }
+          (patientData as { facilityId?: string }).facilityId = resolvedFacilityId;
+          const encounter = this.encounterTranslator.translate(patientData as any, patientReference, encounterId, scriptId);
+          const observations = this.observationTranslator.translate(
+            patientData as any,
+            patientReference,
+            encounterReference,
+            resolvedFacilityId
+          );
+          const conditions = this.conditionTranslator.translate(
+            patientData as any,
+            patientReference,
+            encounterReference,
+            resolvedFacilityId,
+            this.config.source.id
+          );
 
           // Translate complete form submission as QuestionnaireResponse (audit trail)
           const questionnaireResponse = neotreeEntry
             ? this.questionnaireResponseTranslator.translate(patientData as any, patientReference, encounterReference, neotreeEntry)
             : undefined;
 
-          const shrBundle = BundleBuilder.createSHRBundle(encounter, observations, conditions, questionnaireResponse);
-          await this.openhimClient.sendBundleToSHR(shrBundle);
+          const shrResources: FHIRResource[] = [
+            encounter,
+            ...observations,
+            ...conditions,
+            ...(questionnaireResponse ? [questionnaireResponse] : []),
+          ];
+          await this.pushShrResources(shrResources, {
+            uid: neotreeEntry?.uid || 'unknown',
+            impiloUid: decryptedImpiloId,
+          });
+          await this.logShrPatientRecord(patientReference, {
+            uid: neotreeEntry?.uid || 'unknown',
+            impiloId: decryptedImpiloId,
+          });
 
           shrSuccess = true;
           logger.info({ recordId: record.id, impiloId: decryptedImpiloId }, 'Phase 2 Success: Shared Health Record push completed');
@@ -298,7 +400,8 @@ export class AdapterService {
         }
       }
 
-      const patientData = mapNeotreeToPatientData(entry);
+      const patientData = mapNeotreeToPatientData(entry, facilityId);
+      patientData.facilityId = facilityId;
       const validation = validateAllResources(patientData);
 
       if (!validation.canProceed) {
@@ -378,13 +481,13 @@ export class AdapterService {
    * Flow:
    * 1. Retrieve existing patient bundle from Client Registry using identifiers
    * 2. If patient found in CR, use bundle ID for clinical data linkage
-   * 3. Send only SHR bundle (clinical data) to Shared Health Record (/SHR/fhir)
+   * 3. Send SHR resources (clinical data) to Shared Health Record (/SHR/fhir)
    * 4. Avoids duplicate patient creation by reusing CR bundle reference
    */
   async processEntrySHRRetry(
     entry: NeotreeEntry,
     syncId?: string
-  ): Promise<{ crBundleId: string; shrResponse: FHIRBundle }> {
+  ): Promise<{ crBundleId: string; shrResponse: SHRPushResult[] }> {
     try {
       if (!entry.script) {
         throw new Error(`Missing script data for entry ${entry.uid}`);
@@ -467,20 +570,29 @@ export class AdapterService {
 
       // ===== SHARED HEALTH RECORD FLOW (Clinical Data Only) =====
       const patientReference = `Patient/${crResponse.bundleId}`;
-      const encounterReference = `Encounter/${entry.uid}`;
+      const encounterId = uuidv4();
+      const encounterReference = `Encounter/${encounterId}`;
       const scriptId = patientData.scriptId;
+      const facilityIdFromManagingOrg = this.extractFacilityIdFromManagingOrganization(crResponse.patient);
+      const resolvedFacilityId = facilityIdFromManagingOrg || undefined;
+      if (resolvedFacilityId) {
+        (patientData as { facilityId?: string }).facilityId = resolvedFacilityId;
+      }
 
       // Translate clinical resources
-      const encounter = this.encounterTranslator.translate(patientData, patientReference, scriptId);
+      const encounter = this.encounterTranslator.translate(patientData, patientReference, encounterId, scriptId);
       const observations = this.observationTranslator.translate(
         patientData,
         patientReference,
-        encounterReference
+        encounterReference,
+        resolvedFacilityId
       );
       const conditions = this.conditionTranslator.translate(
         patientData,
         patientReference,
-        encounterReference
+        encounterReference,
+        resolvedFacilityId,
+        this.config.source.id
       );
 
       // Translate complete form submission as QuestionnaireResponse (audit trail)
@@ -491,17 +603,28 @@ export class AdapterService {
         entry
       );
 
-      // Build and send SHR bundle
-      const shrBundle = BundleBuilder.createSHRBundle(encounter, observations, conditions, questionnaireResponse);
+      const shrResources: FHIRResource[] = [
+        encounter,
+        ...observations,
+        ...conditions,
+        questionnaireResponse,
+      ];
       logger.debug(
         {
           uid: entry.uid,
-          entryCount: shrBundle.entry?.length || 0,
+          entryCount: shrResources.length,
           resources: `1 Encounter, ${observations.length} Observations, ${conditions.length} Conditions`,
         },
-        'Sending SHR bundle (clinical data only) for retry'
+        'Sending SHR resources (clinical data only) for retry'
       );
-      const shrResponse = await this.openhimClient.sendBundleToSHR(shrBundle);
+      const shrResponse = await this.pushShrResources(shrResources, {
+        uid: entry.uid,
+        impiloUid: entry.impilo_uid,
+      });
+      await this.logShrPatientRecord(patientReference, {
+        uid: entry.uid,
+        impiloUid: entry.impilo_uid || undefined,
+      });
 
       logger.info(
         {
@@ -532,9 +655,10 @@ export class AdapterService {
    * 1. Translate patient data to Patient + RelatedPerson
    * 2. Send CR bundle (demographics) to Client Registry (/CR/fhir)
    * 3. Translate clinical data to Encounter + Observations + Conditions
-   * 4. Send SHR bundle (clinical data) to Shared Health Record (/SHR/fhir)
+   * 4. Send SHR resources (clinical data) to Shared Health Record (/SHR/fhir)
    */
-  async processEntryWithDualFlow(entry: NeotreeEntry, syncId?: string): Promise<{ crResponse: FHIRBundle; shrResponse: FHIRBundle }> {
+  async processEntryWithDualFlow(entry: NeotreeEntry, syncId?: string): Promise<{ crResponse: FHIRBundle; shrResponse: SHRPushResult[] }> {
+    let crSynced = false;
     try {
       if (!entry.script) {
         throw new Error(`Missing script data for entry ${entry.uid}`);
@@ -552,7 +676,7 @@ export class AdapterService {
         );
       }
 
-      const patientData = mapNeotreeToPatientData(entry);
+      const patientData = mapNeotreeToPatientData(entry, facilityId);
       const validation = validateAllResources(patientData);
 
       if (!validation.canProceed) {
@@ -620,7 +744,12 @@ export class AdapterService {
       }
 
       // Translate RelatedPerson (mother) for CR
-      const relatedPerson = this.relatedPersonTranslator.translate(patientData, `Patient/${finalPatient.id || 'new'}`);
+      const relatedPerson = this.relatedPersonTranslator.translate(
+        patientData,
+        `Patient/${finalPatient.id || 'new'}`,
+        facilityId,
+        this.config.source.id
+      );
 
       // Build and send CR bundle
       const crBundle = BundleBuilder.createCRBundle(finalPatient, relatedPerson);
@@ -636,103 +765,162 @@ export class AdapterService {
         );
         throw crError; // Re-throw to mark as failed and retry later
       }
+      crSynced = true;
 
       logger.info(
         { uid: entry.uid, action: isUpdate ? 'updated' : 'created', endpoint: '/CR/fhir' },
         'Successfully sent demographics to Client Registry'
       );
 
-      // ===== RETRIEVE PATIENT BUNDLE ID FROM CR FOR SHR LINKAGE =====
-      // After CR push succeeds, retrieve the patient bundle ID to use for SHR resources
-      const neotreeIdentifierSystem = `urn:neotree:impilo-id`;
-      let crSearchResponse = null;
+      try {
+        // ===== RETRIEVE PATIENT BUNDLE ID FROM CR FOR SHR LINKAGE =====
+        // After CR push succeeds, retrieve the patient bundle ID to use for SHR resources
+        const neotreeIdentifierSystem = `urn:neotree:impilo-id`;
+        let crSearchResponse = null;
 
-      if (entry.impilo_uid) {
-        try {
-          logger.debug({ uid: entry.uid, impiloUid: entry.impilo_uid }, 'Retrieving patient bundle ID from CR for SHR linkage');
-          crSearchResponse = await this.openhimClient.getPatientFromCR(neotreeIdentifierSystem, entry.impilo_uid);
-        } catch (error) {
-          logger.warn(
-            { uid: entry.uid, impiloUid: entry.impilo_uid, error: error instanceof Error ? error.message : String(error) },
-            'Failed to retrieve patient bundle from CR, attempting fallback with uid'
-          );
+        if (entry.impilo_uid) {
+          try {
+            logger.debug({ uid: entry.uid, impiloUid: entry.impilo_uid }, 'Retrieving patient bundle ID from CR for SHR linkage');
+            crSearchResponse = await this.openhimClient.getPatientFromCR(neotreeIdentifierSystem, entry.impilo_uid);
+          } catch (error) {
+            logger.warn(
+              { uid: entry.uid, impiloUid: entry.impilo_uid, error: error instanceof Error ? error.message : String(error) },
+              'Failed to retrieve patient bundle from CR, attempting fallback with uid'
+            );
+          }
         }
-      }
 
-      // Fallback to uid if impilo_uid search failed
-      if (!crSearchResponse) {
+        // Fallback to uid if impilo_uid search failed
+        if (!crSearchResponse) {
+          try {
+            logger.debug({ uid: entry.uid }, 'Retrieving patient bundle ID from CR using uid for SHR linkage');
+            crSearchResponse = await this.openhimClient.getPatientFromCR(neotreeIdentifierSystem, entry.uid);
+          } catch (error) {
+            logger.warn(
+              { uid: entry.uid, error: error instanceof Error ? error.message : String(error) },
+              'Failed to retrieve patient bundle from CR using uid'
+            );
+          }
+        }
+
+        if (!crSearchResponse || !crSearchResponse.bundleId) {
+          const cachedBundleId = await this.getCachedCrBundleId(entry.impilo_uid, entry.uid);
+          if (cachedBundleId) {
+            logger.warn(
+              { uid: entry.uid, bundleId: cachedBundleId },
+              'CR lookup failed, using cached bundleId for SHR linkage'
+            );
+            crSearchResponse = { bundleId: cachedBundleId };
+          }
+        }
+
+        if (!crSearchResponse || !crSearchResponse.bundleId) {
+          throw new Error('Cannot link clinical data to SHR: Patient bundle not found in CR after demographics push');
+        }
+        await this.storeCrBundleId(entry.impilo_uid, entry.uid, crSearchResponse.bundleId);
+
+        logger.debug({ uid: entry.uid, bundleId: crSearchResponse.bundleId }, 'Retrieved patient bundle ID from CR for SHR');
+
+        // ===== SHARED HEALTH RECORD FLOW - PHASE 1: SHALLOW PATIENT =====
+        // Post shallow patient record to SHR before sending clinical data
+        let shrPatientId: string | undefined;
         try {
-          logger.debug({ uid: entry.uid }, 'Retrieving patient bundle ID from CR using uid for SHR linkage');
-          crSearchResponse = await this.openhimClient.getPatientFromCR(neotreeIdentifierSystem, entry.uid);
+          const shallowPatient = crSearchResponse.patient
+            ? this.createShallowPatientFromCR(crSearchResponse.patient)
+            : this.createShallowPatientFromEntry(patientData, crSearchResponse.bundleId, facilityId);
+          logger.debug(
+            { uid: entry.uid, bundleId: crSearchResponse.bundleId },
+            'Creating shallow patient for SHR'
+          );
+          const shrPatient = await this.openhimClient.sendShallowPatientToSHR(shallowPatient);
+          shrPatientId = shrPatient?.id;
+          logger.info(
+            { uid: entry.uid, bundleId: crSearchResponse.bundleId, shrPatientId, endpoint: '/SHR/fhir/Patient' },
+            'Shallow patient posted successfully to SHR'
+          );
         } catch (error) {
           logger.warn(
             { uid: entry.uid, error: error instanceof Error ? error.message : String(error) },
-            'Failed to retrieve patient bundle from CR using uid'
+            'Shallow patient POST to SHR failed, continuing with clinical data'
           );
         }
+
+        // ===== SHARED HEALTH RECORD FLOW - PHASE 2: CLINICAL DATA =====
+        // Build patient reference for SHR resources using the CR bundle ID
+        const patientReference = `Patient/${shrPatientId || crSearchResponse.bundleId}`;
+        const encounterId = uuidv4();
+        const encounterReference = `Encounter/${encounterId}`;
+        const dualFlowScriptId = patientData.scriptId;
+        const facilityIdFromManagingOrg = this.extractFacilityIdFromManagingOrganization(crSearchResponse.patient);
+        const resolvedFacilityId = facilityId || facilityIdFromManagingOrg;
+        if (!resolvedFacilityId) {
+          throw new Error('Cannot push SHR resources: missing facilityId for Questionnaire reference');
+        }
+        (patientData as { facilityId?: string }).facilityId = resolvedFacilityId;
+
+        // Translate clinical resources
+        const encounter = this.encounterTranslator.translate(patientData, patientReference, encounterId, dualFlowScriptId);
+        const observations = this.observationTranslator.translate(
+          patientData,
+          patientReference,
+          encounterReference,
+          resolvedFacilityId
+        );
+        const conditions = this.conditionTranslator.translate(
+          patientData,
+          patientReference,
+          encounterReference,
+          resolvedFacilityId,
+          this.config.source.id
+        );
+
+        // Translate complete form submission as QuestionnaireResponse (audit trail)
+        const questionnaireResponse = this.questionnaireResponseTranslator.translate(
+          patientData,
+          patientReference,
+          encounterReference,
+          entry
+        );
+
+        const shrResources: FHIRResource[] = [
+          encounter,
+          ...observations,
+          ...conditions,
+          questionnaireResponse,
+        ];
+        logger.debug(
+          { uid: entry.uid, entryCount: shrResources.length, resources: `1 Encounter, ${observations.length} Observations, ${conditions.length} Conditions` },
+          'Sending SHR resources (clinical data)'
+        );
+        const shrResponse = await this.pushShrResources(shrResources, {
+          uid: entry.uid,
+          impiloUid: entry.impilo_uid,
+        });
+        await this.logShrPatientRecord(patientReference, {
+          uid: entry.uid,
+          impiloUid: entry.impilo_uid || undefined,
+        });
+
+        logger.info(
+          { uid: entry.uid, endpoint: '/SHR/fhir', resources: `1 Encounter, ${observations.length} Observations, ${conditions.length} Conditions` },
+          'Successfully sent clinical data to Shared Health Record'
+        );
+
+        logger.info(
+          { uid: entry.uid, syncId, crAction: isUpdate ? 'updated' : 'created', shrResources: shrResponse.length },
+          'Entry processed successfully with dual-flow'
+        );
+
+        return { crResponse: crBundleResponse, shrResponse };
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        throw new AdapterError(
+          `SHR push failed after CR success: ${errorMessage}`,
+          'SHR_SYNC_FAILED',
+          502,
+          { crSynced: true, shrSynced: false }
+        );
       }
-
-      if (!crSearchResponse || !crSearchResponse.bundleId) {
-        throw new Error('Cannot link clinical data to SHR: Patient bundle not found in CR after demographics push');
-      }
-
-      logger.debug({ uid: entry.uid, bundleId: crSearchResponse.bundleId }, 'Retrieved patient bundle ID from CR for SHR');
-
-      // ===== SHARED HEALTH RECORD FLOW - PHASE 1: SHALLOW PATIENT =====
-      // Post shallow patient record to SHR before sending clinical data
-      if (!crSearchResponse.patient) {
-        throw new Error('Cannot create shallow patient: No patient data available from CR');
-      }
-
-      const shallowPatient = this.createShallowPatientFromCR(crSearchResponse.patient);
-      logger.debug(
-        { uid: entry.uid, bundleId: crSearchResponse.bundleId },
-        'Creating shallow patient for SHR'
-      );
-      await this.openhimClient.sendShallowPatientToSHR(shallowPatient);
-      logger.info(
-        { uid: entry.uid, bundleId: crSearchResponse.bundleId, endpoint: '/SHR/fhir/Patient' },
-        'Shallow patient posted successfully to SHR'
-      );
-
-      // ===== SHARED HEALTH RECORD FLOW - PHASE 2: CLINICAL DATA =====
-      // Build patient reference for SHR resources using the CR bundle ID
-      const patientReference = `Patient/${crSearchResponse.bundleId}`;
-      const encounterReference = `Encounter/${entry.uid}`;
-      const dualFlowScriptId = patientData.scriptId;
-
-      // Translate clinical resources
-      const encounter = this.encounterTranslator.translate(patientData, patientReference, dualFlowScriptId);
-      const observations = this.observationTranslator.translate(patientData, patientReference, encounterReference);
-      const conditions = this.conditionTranslator.translate(patientData, patientReference, encounterReference);
-
-      // Translate complete form submission as QuestionnaireResponse (audit trail)
-      const questionnaireResponse = this.questionnaireResponseTranslator.translate(
-        patientData,
-        patientReference,
-        encounterReference,
-        entry
-      );
-
-      // Build and send SHR bundle
-      const shrBundle = BundleBuilder.createSHRBundle(encounter, observations, conditions, questionnaireResponse);
-      logger.debug(
-        { uid: entry.uid, entryCount: shrBundle.entry?.length || 0, resources: `1 Encounter, ${observations.length} Observations, ${conditions.length} Conditions` },
-        'Sending SHR bundle (clinical data)'
-      );
-      const shrResponse = await this.openhimClient.sendBundleToSHR(shrBundle);
-
-      logger.info(
-        { uid: entry.uid, endpoint: '/SHR/fhir', resources: `1 Encounter, ${observations.length} Observations, ${conditions.length} Conditions` },
-        'Successfully sent clinical data to Shared Health Record'
-      );
-
-      logger.info(
-        { uid: entry.uid, syncId, crAction: isUpdate ? 'updated' : 'created', shrResources: shrBundle.entry?.length || 0 },
-        'Entry processed successfully with dual-flow'
-      );
-
-      return { crResponse: crBundleResponse, shrResponse };
     } catch (error) {
       throw handleError(error, logger, { uid: entry.uid, syncId });
     }
@@ -759,10 +947,13 @@ export class AdapterService {
    * @returns Shallow patient FHIR resource for SHR
    */
   private createShallowPatientFromCR(crPatient: any): any {
+    const impiloUidIdentifier = (crPatient.identifier || []).find(
+      (identifier: { system?: string }) => identifier.system === 'urn:impilo:uid'
+    );
     const shallowPatient: any = {
       resourceType: 'Patient',
       id: crPatient.id,
-      identifier: crPatient.identifier || [],
+      identifier: impiloUidIdentifier ? [impiloUidIdentifier] : [],
     };
 
     // Include name(s) from CR
@@ -773,11 +964,6 @@ export class AdapterService {
     // Include gender from CR
     if (crPatient.gender) {
       shallowPatient.gender = crPatient.gender;
-    }
-
-    // Include birthDate from CR
-    if (crPatient.birthDate) {
-      shallowPatient.birthDate = crPatient.birthDate;
     }
 
     logger.debug(
@@ -795,9 +981,98 @@ export class AdapterService {
   }
 
   /**
+   * Create shallow patient from local entry data when CR patient is unavailable
+   */
+  private createShallowPatientFromEntry(patientData: any, bundleId: string, facilityId?: string): FHIRPatient {
+    const translatedPatient = this.patientTranslator.translate(patientData as any, facilityId);
+    const impiloUidIdentifier = (translatedPatient.identifier || []).find(
+      (identifier: { system?: string }) => identifier.system === 'urn:impilo:uid'
+    );
+    const shallowPatient: FHIRPatient = {
+      resourceType: 'Patient',
+      id: bundleId,
+      identifier: impiloUidIdentifier ? [impiloUidIdentifier] : [],
+    };
+
+    if (translatedPatient.name && translatedPatient.name.length > 0) {
+      shallowPatient.name = translatedPatient.name;
+    }
+
+    if (translatedPatient.gender) {
+      shallowPatient.gender = translatedPatient.gender;
+    }
+
+    logger.debug(
+      {
+        patientId: bundleId,
+        identifierCount: shallowPatient.identifier?.length || 0,
+        hasName: !!shallowPatient.name,
+        hasGender: !!shallowPatient.gender,
+        hasBirthDate: !!shallowPatient.birthDate,
+      },
+      'Created shallow patient from entry data'
+    );
+
+    return shallowPatient;
+  }
+
+  private extractFacilityIdFromManagingOrganization(patient?: FHIRPatient | null): string | undefined {
+    const reference = patient?.managingOrganization?.reference;
+    if (!reference) {
+      return undefined;
+    }
+    const parts = reference.split('/');
+    return parts[parts.length - 1] || undefined;
+  }
+
+  /**
    * Close database connection
    */
   async disconnect(): Promise<void> {
     await this.pool.end();
+  }
+
+  private async getCachedCrBundleId(impiloUid?: string | null, uid?: string | null): Promise<string | undefined> {
+    if (impiloUid) {
+      const result = await this.pool.query<{ cr_bundle_id: string }>(
+        `SELECT cr_bundle_id FROM cr_patient_links WHERE impilo_uid = $1 ORDER BY updated_at DESC LIMIT 1`,
+        [impiloUid]
+      );
+      if (result.rows[0]?.cr_bundle_id) {
+        return result.rows[0].cr_bundle_id;
+      }
+    }
+    if (uid) {
+      const result = await this.pool.query<{ cr_bundle_id: string }>(
+        `SELECT cr_bundle_id FROM cr_patient_links WHERE uid = $1 ORDER BY updated_at DESC LIMIT 1`,
+        [uid]
+      );
+      if (result.rows[0]?.cr_bundle_id) {
+        return result.rows[0].cr_bundle_id;
+      }
+    }
+    return undefined;
+  }
+
+  private async storeCrBundleId(impiloUid: string | null | undefined, uid: string | null | undefined, bundleId: string): Promise<void> {
+    if (impiloUid) {
+      await this.pool.query(
+        `INSERT INTO cr_patient_links (impilo_uid, uid, cr_bundle_id)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (impilo_uid) WHERE impilo_uid IS NOT NULL
+         DO UPDATE SET uid = EXCLUDED.uid, cr_bundle_id = EXCLUDED.cr_bundle_id, updated_at = NOW()`,
+        [impiloUid, uid || null, bundleId]
+      );
+      return;
+    }
+    if (uid) {
+      await this.pool.query(
+        `INSERT INTO cr_patient_links (uid, cr_bundle_id)
+         VALUES ($1, $2)
+         ON CONFLICT (uid) WHERE uid IS NOT NULL
+         DO UPDATE SET cr_bundle_id = EXCLUDED.cr_bundle_id, updated_at = NOW()`,
+        [uid, bundleId]
+      );
+    }
   }
 }

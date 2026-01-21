@@ -88,12 +88,13 @@ export class BundleBuilder {
 
     // Add Condition resources
     conditions.forEach((cond) => {
+      const conditionHasId = !!cond.id;
       entries.push({
-        fullUrl: cond.id ? `Condition/${cond.id}` : `urn:uuid:${uuidv4()}`,
+        fullUrl: conditionHasId ? `Condition/${cond.id}` : `urn:uuid:${uuidv4()}`,
         resource: cond,
         request: {
-          method: 'POST',
-          url: 'Condition',
+          method: conditionHasId ? 'PUT' : 'POST',
+          url: conditionHasId ? `Condition/${cond.id}` : 'Condition',
         },
       });
     });

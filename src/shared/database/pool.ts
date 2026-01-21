@@ -85,6 +85,32 @@ export async function testConnection(): Promise<boolean> {
 }
 
 /**
+ * Ensure CR patient link cache table exists
+ */
+export async function ensureCrPatientLinksTable(): Promise<void> {
+  const pool = getPool();
+  await pool.query(
+    `CREATE TABLE IF NOT EXISTS cr_patient_links (
+      id BIGSERIAL PRIMARY KEY,
+      impilo_uid TEXT,
+      uid TEXT,
+      cr_bundle_id TEXT NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );`
+  );
+  await pool.query(
+    `CREATE UNIQUE INDEX IF NOT EXISTS cr_patient_links_impilo_uid_idx
+     ON cr_patient_links (impilo_uid)
+     WHERE impilo_uid IS NOT NULL;`
+  );
+  await pool.query(
+    `CREATE UNIQUE INDEX IF NOT EXISTS cr_patient_links_uid_idx
+     ON cr_patient_links (uid)
+     WHERE uid IS NOT NULL;`
+  );
+}
+
+/**
  * Close the database connection pool
  */
 export async function closePool(): Promise<void> {

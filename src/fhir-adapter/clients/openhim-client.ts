@@ -82,6 +82,70 @@ export class OpenHIMClient {
   }
 
   /**
+   * Send single resource to SHR endpoint, using PUT with resource id when available
+   */
+  async sendResourceToSHR(resource: FHIRResource): Promise<{ resource: FHIRResource; status: number; endpoint: string }> {
+    return this.sendResourceToEndpointWithLogging(resource, this.config.openhim.shrEndpoint, 'shr');
+  }
+
+  async getPatientEverythingFromSHR(patientId: string): Promise<unknown> {
+    if (!patientId) {
+      throw new Error('Patient ID is required to pull SHR record');
+    }
+
+    const endpoint = `${this.config.openhim.shrEndpoint}/Patient/${patientId}/$everything`;
+    const authHeaders = this.generateAuthHeaders();
+
+    logger.debug({ endpoint, patientId }, 'Pulling patient record from SHR');
+
+    const response = await this.client.get(endpoint, {
+      headers: {
+        ...authHeaders,
+        'X-OpenHIM-ClientID': this.config.openhim.clientId || this.config.source.id,
+        'X-Forwarded-For': 'neotree-adapter',
+      },
+    });
+
+    return response.data;
+  }
+
+  async findPatientIdFromSHRByIdentifier(
+    identifierSystem: string,
+    identifierValue: string
+  ): Promise<string | null> {
+    const endpoint = `${this.config.openhim.shrEndpoint}/Patient`;
+    const authHeaders = this.generateAuthHeaders();
+
+    const response = await this.client.get<FHIRBundle>(endpoint, {
+      params: {
+        identifier: `${identifierSystem}|${identifierValue}`,
+      },
+      headers: {
+        ...authHeaders,
+        'X-OpenHIM-ClientID': this.config.openhim.clientId || this.config.source.id,
+        'X-Forwarded-For': 'neotree-adapter',
+      },
+    });
+
+    const firstEntry = response.data.entry?.[0];
+    const patient = firstEntry?.resource as FHIRPatient | undefined;
+    return patient?.id || null;
+  }
+
+  async getPatientEverythingFromSHRByIdentifier(
+    identifierSystem: string,
+    identifierValue: string
+  ): Promise<{ patientId: string; record: unknown }> {
+    const patientId = await this.findPatientIdFromSHRByIdentifier(identifierSystem, identifierValue);
+    if (!patientId) {
+      throw new Error('Patient not found in SHR by identifier');
+    }
+
+    const record = await this.getPatientEverythingFromSHR(patientId);
+    return { patientId, record };
+  }
+
+  /**
    * Send shallow patient to SHR Patient endpoint
    * Used for demonstration: POST shallow patient record to /SHR/fhir/Patient
    * Includes only identifiers and basic demographics
@@ -168,6 +232,99 @@ export class OpenHIMClient {
   async sendBundle(bundle: FHIRBundle): Promise<FHIRBundle> {
     // Default to CR endpoint for backward compatibility
     return this.sendBundleToEndpoint(bundle, this.config.openhim.channelPath);
+  }
+
+  /**
+   * Internal method to send resource to any endpoint with CR/SHR specific logging
+   */
+  private async sendResourceToEndpointWithLogging(
+    resource: FHIRResource,
+    endpointBase: string,
+    endpointType: 'cr' | 'shr'
+  ): Promise<{ resource: FHIRResource; status: number; endpoint: string }> {
+    const startTime = Date.now();
+
+    if (!resource || !resource.resourceType) {
+      throw new Error('Cannot send resource: missing resourceType');
+    }
+
+    // Clean resource before sending
+    const cleanedResource = FHIRCleaner.cleanResource(resource);
+    const validationIssues = FHIRCleaner.validateResource(cleanedResource);
+    if (validationIssues.length > 0) {
+      logger.warn(
+        { resourceType: cleanedResource.resourceType, issues: validationIssues },
+        'Resource has validation issues after cleaning'
+      );
+    }
+
+    const hasId = !!cleanedResource.id;
+    const method = hasId ? 'PUT' : 'POST';
+    const endpoint = hasId
+      ? `${endpointBase}/${cleanedResource.resourceType}/${cleanedResource.id}`
+      : `${endpointBase}/${cleanedResource.resourceType}`;
+
+    try {
+      const authHeaders = this.generateAuthHeaders();
+
+      logger.debug(
+        { endpoint, method, resourceType: cleanedResource.resourceType, hasId },
+        'Sending cleaned FHIR resource to endpoint'
+      );
+
+      const response = await this.client.request<FHIRResource>({
+        method,
+        url: endpoint,
+        data: cleanedResource,
+        headers: {
+          ...authHeaders,
+          'X-OpenHIM-ClientID': this.config.openhim.clientId || this.config.source.id,
+          'X-Forwarded-For': 'neotree-adapter',
+        },
+      });
+
+      const durationMs = Date.now() - startTime;
+      const logEntry = {
+        timestamp: new Date().toISOString(),
+        action: 'push' as const,
+        requestBundle: cleanedResource,
+        responseBundle: response.data,
+        httpStatus: response.status,
+        success: true,
+        durationMs,
+      };
+
+      if (endpointType === 'cr') {
+        jsonLogger.logCRRequest(logEntry);
+      } else {
+        jsonLogger.logSHRRequest(logEntry);
+      }
+
+      return { resource: response.data, status: response.status, endpoint };
+    } catch (error) {
+      const durationMs = Date.now() - startTime;
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      const httpStatus = error instanceof AxiosError ? error.response?.status : undefined;
+
+      const logEntry = {
+        timestamp: new Date().toISOString(),
+        action: 'push' as const,
+        requestBundle: cleanedResource,
+        responseBundle: error instanceof AxiosError ? error.response?.data : undefined,
+        httpStatus,
+        success: false,
+        error: errorMessage,
+        durationMs,
+      };
+
+      if (endpointType === 'cr') {
+        jsonLogger.logCRRequest(logEntry);
+      } else {
+        jsonLogger.logSHRRequest(logEntry);
+      }
+
+      throw error;
+    }
   }
 
   /**
@@ -473,38 +630,10 @@ export class OpenHIMClient {
         return { bundleId, patient };
       }
 
-      // No patient entry found - try to retrieve using the bundle ID directly
       logger.warn(
         { bundleId, identifierSystem, impiloId: identifierValue },
-        'No patient entry in CR search bundle, attempting to retrieve patient directly by bundle ID'
+        'No patient entry in CR search bundle; returning bundleId only'
       );
-
-      try {
-        const directResponse = await this.client.get<FHIRPatient>(
-          `${this.config.openhim.crEndpoint}/Patient/${bundleId}`,
-          {
-            headers: {
-              ...authHeaders,
-              'X-OpenHIM-ClientID': this.config.openhim.clientId || this.config.source.id,
-            },
-          }
-        );
-
-        if (directResponse.data && directResponse.data.resourceType === 'Patient') {
-          const patient = directResponse.data as FHIRPatient;
-          logger.info(
-            { bundleId, patientId: patient.id },
-            'Successfully retrieved patient directly from CR by bundle ID'
-          );
-
-          return { bundleId, patient };
-        }
-      } catch (directError) {
-        logger.debug(
-          { bundleId, error: directError instanceof Error ? directError.message : String(directError) },
-          'Failed to retrieve patient directly by bundle ID, returning bundleId only'
-        );
-      }
 
       // Log CR pull "not found" case
       jsonLogger.logCRRequest({

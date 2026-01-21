@@ -6,6 +6,7 @@
 export interface FHIRResource {
   resourceType: string;
   id?: string;
+  extension?: Extension[];
   meta?: {
     versionId?: string;
     lastUpdated?: string;
@@ -129,6 +130,17 @@ export interface FHIRRelatedPerson extends FHIRResource {
   period?: Period;
 }
 
+export interface Extension {
+  url: string;
+  valueCodeableConcept?: CodeableConcept;
+  valueString?: string;
+  valueBoolean?: boolean;
+  valueQuantity?: Quantity;
+  valueReference?: Reference;
+  valueInteger?: number;
+  valueDateTime?: string;
+}
+
 export interface FHIREncounter extends FHIRResource {
   resourceType: 'Encounter';
   identifier?: Identifier[];
@@ -143,6 +155,7 @@ export interface FHIREncounter extends FHIRResource {
   hospitalization?: EncounterHospitalization;
   location?: EncounterLocation[];
   serviceProvider?: Reference;
+  extension?: Extension[];
 }
 
 export interface EncounterParticipant {
@@ -255,6 +268,54 @@ export interface FHIRCondition extends FHIRResource {
   recorder?: Reference;
   asserter?: Reference;
   note?: Annotation[];
+}
+
+export interface FHIRQuestionnaireResponse extends FHIRResource {
+  resourceType: 'QuestionnaireResponse';
+  identifier?: Identifier[];
+  questionnaire?: string;
+  status: 'in-progress' | 'completed' | 'amended' | 'entered-in-error' | 'stopped';
+  subject?: Reference;
+  encounter?: Reference;
+  authored?: string;
+  author?: Reference;
+  source?: Reference;
+  item?: QuestionnaireResponseItem[];
+}
+
+export interface QuestionnaireResponseItem {
+  linkId: string;
+  definition?: string;
+  text?: string;
+  answer?: QuestionnaireResponseAnswer[];
+  item?: QuestionnaireResponseItem[];
+}
+
+export interface QuestionnaireResponseAnswer {
+  valueBoolean?: boolean;
+  valueDecimal?: number;
+  valueInteger?: number;
+  valueDate?: string;
+  valueDateTime?: string;
+  valueTime?: string;
+  valueString?: string;
+  valueUri?: string;
+  valueAttachment?: Attachment;
+  valueCoding?: Coding;
+  valueQuantity?: Quantity;
+  valueReference?: Reference;
+  item?: QuestionnaireResponseItem[];
+}
+
+export interface Attachment {
+  contentType?: string;
+  language?: string;
+  data?: string;
+  url?: string;
+  size?: number;
+  hash?: string;
+  title?: string;
+  creation?: string;
 }
 
 export interface FHIRBundle extends FHIRResource {

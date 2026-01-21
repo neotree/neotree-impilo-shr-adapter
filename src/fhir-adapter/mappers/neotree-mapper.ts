@@ -4,7 +4,6 @@
  */
 
 import { NeotreeEntry, NeotreePatientData } from '../../shared/types/neotree.types';
-import { getConfig } from '../../shared/config';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function getFieldValue(entries: Record<string, any>, fieldName: string): any {
@@ -45,38 +44,137 @@ function _combineDateAndTime(date: string | null, time?: string | null): string 
 
 /**
  * Map Neotree entry to standardized patient data
+ * Enhanced to extract 40+ fields including examinations, maternal history, and labour data
  */
-export function mapNeotreeToPatientData(entry: NeotreeEntry): NeotreePatientData {
-  const config = getConfig();
+export function mapNeotreeToPatientData(
+  entry: NeotreeEntry,
+  facilityId?: string,
+  facilityName?: string
+): NeotreePatientData {
   const { entries } = entry;
 
-  // Extract baby information
+  // Helper function to extract array values (for SET<STRING> fields)
+  const getFieldArrayValue = (fieldName: string): string[] | undefined => {
+    const field = entries[fieldName];
+    if (!field || !field.values || !field.values.value) {
+      return undefined;
+    }
+    const values = field.values.value;
+    if (!Array.isArray(values) || values.length === 0) {
+      return undefined;
+    }
+    return values.filter((v) => v && v !== 'NONE') as string[];
+  };
+
+  // Helper function to get boolean value
+  const getFieldBoolean = (fieldName: string): boolean | undefined => {
+    const value = getFieldValue(entries, fieldName);
+    if (value === undefined || value === null) return undefined;
+    if (typeof value === 'boolean') return value;
+    if (typeof value === 'string') {
+      return value.toUpperCase() === 'Y' || value.toUpperCase() === 'TRUE' || value === '1';
+    }
+    return !!value;
+  };
+
+  // ===== BABY DEMOGRAPHICS =====
   const babyFirstName = getFieldValue(entries, 'BabyFirst');
   const babyLastName = getFieldValue(entries, 'BabyLast');
   const gender = getFieldValue(entries, 'Gender');
   const dobDate = getFieldValue(entries, 'DOBTOB');
+  const timeOfBirth = getFieldValue(entries, 'TimeOfBirth');
+
+  // ===== BABY VITAL SIGNS & MEASUREMENTS =====
   const birthWeight = getFieldValue(entries, 'BirthWeight');
+  const admissionWeight = getFieldValue(entries, 'AdmissionWeight');
   const length = getFieldValue(entries, 'Length');
   const ofc = getFieldValue(entries, 'OFC');
   const gestation = getFieldValue(entries, 'Gestation');
-
-  // Extract mother information
-  const motherFirstName = getFieldValue(entries, 'MotherFirstName');
-  const motherSurname = getFieldValue(entries, 'MotherSurname');
-  const motherHIVStatus = getFieldValue(entries, 'HIVtestResult');
-  const motherHIVTestDate = getFieldValue(entries, 'DateHIVtest');
-
-  // Extract clinical data
-  const apgar1 = getFieldValue(entries, 'Apgar1');
-  const apgar5 = getFieldValue(entries, 'Apgar5');
-  const apgar10 = getFieldValue(entries, 'Apgar10');
-  const admissionReason = getFieldLabel(entries, 'AdmReason');
-
-  // Extract vital signs
+  const methodEstGest = getFieldValue(entries, 'MethodEstGest');
   const heartRate = getFieldValue(entries, 'HR') || getFieldValue(entries, 'DischHR');
   const respiratoryRate = getFieldValue(entries, 'RR') || getFieldValue(entries, 'DischRR');
   const temperature = getFieldValue(entries, 'Temperature') || getFieldValue(entries, 'DischTemp');
   const saturation = getFieldValue(entries, 'SatsAir') || getFieldValue(entries, 'DischSats');
+  const bloodSugarMmol = getFieldValue(entries, 'BSmmol');
+  const bloodSugarMg = getFieldValue(entries, 'Bsmg');
+
+  // ===== BABY APGAR & BIRTH =====
+  const apgar1 = getFieldValue(entries, 'Apgar1');
+  const apgar5 = getFieldValue(entries, 'Apgar5');
+  const apgar10 = getFieldValue(entries, 'Apgar10');
+  const cryBirth = getFieldBoolean('CryBirth');
+  const resuscitation = getFieldArrayValue('Resus');
+
+  // ===== BABY EXAMINATIONS - GENERAL =====
+  const suckReflex = getFieldValue(entries, 'SuckReflex');
+  const palate = getFieldValue(entries, 'Palate');
+  const headShape = getFieldValue(entries, 'HeadShape');
+  const dysmorphic = getFieldBoolean('Dysmorphic');
+  const tone = getFieldValue(entries, 'Tone');
+  const spine = getFieldValue(entries, 'Spine');
+  const activity = getFieldValue(entries, 'Activity');
+  const fontanelle = getFieldValue(entries, 'Fontanelle');
+
+  // ===== BABY EXAMINATIONS - RESPIRATORY =====
+  const signsRD = getFieldArrayValue('SignsRD');
+  const wob = getFieldValue(entries, 'Wob');
+  const chestAusc = getFieldArrayValue('ChestAusc');
+  const colour = getFieldValue(entries, 'Colour');
+
+  // ===== BABY EXAMINATIONS - CIRCULATION =====
+  const crt = getFieldValue(entries, 'CRT');
+
+  // ===== BABY EXAMINATIONS - ABDOMEN & GENITALIA =====
+  const signsDehydrations = getFieldArrayValue('SignsDehydrations');
+  const abdomen = getFieldArrayValue('Abdomen');
+  const umbilicus = getFieldArrayValue('Umbilicus');
+  const genitalia = getFieldValue(entries, 'Genitalia');
+  const anus = getFieldBoolean('Anus2');
+
+  // ===== BABY EXAMINATIONS - MUSCULOSKELETAL & SKIN =====
+  const mskProblems = getFieldArrayValue('MSKproblems');
+  const jaundice = getFieldValue(entries, 'Jaundice');
+  const skin = getFieldArrayValue('Skin');
+
+  // ===== MOTHER/GUARDIAN DETAILS =====
+  const motherFirstName = getFieldValue(entries, 'MotherFirstName');
+  const motherSurname = getFieldValue(entries, 'MotherSurname');
+  const motherDOB = getFieldValue(entries, 'MotherDOB');
+  const motherAgeYears = getFieldValue(entries, 'MatAgeYrs');
+  const maritalStatus = getFieldValue(entries, 'MaritalStat');
+  const motherEthnicity = getFieldValue(entries, 'Ethnicity');
+  const motherReligion = getFieldValue(entries, 'Religion');
+  const motherProvince = getFieldValue(entries, 'MatAddrProvince');
+
+  // ===== MOTHER HIV/INFECTION STATUS =====
+  const motherHIVTest = getFieldBoolean('MatHIVtest');
+  const motherHIVTestDate = getFieldValue(entries, 'DateHIVtest');
+  const motherHIVStatus = getFieldValue(entries, 'HIVtestResult');
+  const haart = getFieldBoolean('HAART');
+  const maternalViralLoad = getFieldValue(entries, 'VLNumber');
+  const nvpGiven = getFieldBoolean('NVPgiven');
+  const syphilisTestDate = getFieldValue(entries, 'ANVDRLDate');
+  const syphilisResult = getFieldValue(entries, 'ANVDRLResult');
+
+  // ===== MOTHER PREGNANCY CONDITIONS =====
+  const pregnancyConditions = getFieldArrayValue('PregConditions');
+  const antenatalCareVisits = getFieldValue(entries, 'AntenatalCare');
+  const tetanusToxoidVaccine = getFieldBoolean('TTV');
+  const ironSupplementation = getFieldBoolean('Iron');
+  const folateSupplementation = getFieldBoolean('Folate');
+  const antenatalSteroids = getFieldBoolean('ANSteroids');
+
+  // ===== LABOUR & DELIVERY HISTORY =====
+  const labourProblems = getFieldArrayValue('ProbsLab');
+  const labourDuration = getFieldValue(entries, 'DurationLab');
+  const romLength = getFieldValue(entries, 'ROMLength');
+  const maternalSepsisRiskFactors = getFieldArrayValue('RFSepsis');
+  const modeOfDelivery = getFieldValue(entries, 'ModeDelivery');
+
+  // ===== CLINICAL DATA & ADMISSION =====
+  const admissionReason = getFieldLabel(entries, 'AdmReason');
+  const admissionDateTime = getFieldValue(entries, 'DateTimeAdmission');
+  const dischargeDateTime = getFieldValue(entries, 'DateTimeDischarge');
 
   // Extract diagnoses
   const diagnoses: string[] = [];
@@ -99,75 +197,133 @@ export function mapNeotreeToPatientData(entry: NeotreeEntry): NeotreePatientData
     }
   }
 
-  // Extract timestamps
-  const admissionDateTime = getFieldValue(entries, 'DateTimeAdmission');
-  const dischargeDateTime = getFieldValue(entries, 'DateTimeDischarge');
-  // Use completed_at from Neotree entry - this is when the form was submitted/completed
+  // ===== OTHER DATA =====
   const completedAt = entry.completed_at;
-
-  // Other clinical data
-  const ethnicity = getFieldValue(entries, 'Ethnicity');
-  const religion = getFieldValue(entries, 'Religion');
-  const modeOfDelivery = getFieldValue(entries, 'ModeDelivery');
   const birthPlace = getFieldValue(entries, 'BirthPlace');
 
   return {
+    // Patient identifiers
     uid: entry.uid,
     impilo_uid: entry.impilo_uid,
     uniqueKey: entry.unique_key,
 
-    // Baby details
+    // Baby demographics
     babyFirstName,
     babyLastName,
     gender: mapGender(gender),
     dateOfBirth: dobDate,
+    timeOfBirth,
+
+    // Baby vital signs & measurements
     birthWeight,
+    admissionWeight,
     length,
     ofc,
     gestation,
-
-    // Mother details
-    motherFirstName,
-    motherSurname,
-    motherHIVStatus,
-    motherHIVTestDate,
-
-    // Clinical data
-    apgar1,
-    apgar5,
-    apgar10,
-    admissionReason,
-    diagnoses,
-
-    // Facility information
-    facilityId: config.source.facilityId,
-    facilityName: config.source.facilityName,
-    birthPlace,
-
-    // Timestamps
-    admissionDateTime,
-    dischargeDateTime,
-    completedAt,
-
-    // Vital signs
+    methodEstGest,
     heartRate,
     respiratoryRate,
     temperature,
     saturation,
+    bloodSugarMmol,
+    bloodSugarMg,
 
-    // Additional
-    ethnicity,
-    religion,
+    // Baby Apgar & birth
+    apgar1,
+    apgar5,
+    apgar10,
+    cryBirth,
+    resuscitation,
+
+    // Baby examinations - general
+    suckReflex,
+    palate,
+    headShape,
+    dysmorphic,
+    tone,
+    spine,
+    activity,
+    fontanelle,
+
+    // Baby examinations - respiratory
+    signsRD,
+    wob,
+    chestAusc,
+    colour,
+
+    // Baby examinations - circulation
+    crt,
+
+    // Baby examinations - abdomen & genitalia
+    signsDehydrations,
+    abdomen,
+    umbilicus,
+    genitalia,
+    anus,
+
+    // Baby examinations - musculoskeletal & skin
+    mskProblems,
+    jaundice,
+    skin,
+
+    // Mother/Guardian details
+    motherFirstName,
+    motherSurname,
+    motherDOB,
+    motherAgeYears,
+    maritalStatus,
+    motherEthnicity,
+    motherReligion,
+    motherProvince,
+
+    // Mother HIV/Infection status
+    motherHIVTest,
+    motherHIVTestDate,
+    motherHIVStatus,
+    haart,
+    maternalViralLoad,
+    nvpGiven,
+    syphilisTestDate,
+    syphilisResult,
+
+    // Mother pregnancy conditions
+    pregnancyConditions,
+    antenatalCareVisits,
+    tetanusToxoidVaccine,
+    ironSupplementation,
+    folateSupplementation,
+    antenatalSteroids,
+
+    // Labour & delivery history
+    labourProblems,
+    labourDuration,
+    romLength,
+    maternalSepsisRiskFactors,
     modeOfDelivery,
 
-    // Metadata
+    // Clinical data & admission
+    admissionReason,
+    admissionDateTime,
+    dischargeDateTime,
+    diagnoses,
+
+    // Facility information
+    facilityId,
+    facilityName,
+    birthPlace,
+
+    // Timestamps
+    completedAt,
+
+    // Script metadata
     scriptType: entry.script?.type || 'admission',
     hospitalId: entry.hospital_id,
+    scriptId: entry.script?.id,
   };
 }
 
 /**
- * Map Neotree gender codes to FHIR gender
+ * Map Neotree gender codes to FHIR 1
  */
 function mapGender(code: string | null): string | undefined {
   if (!code) return undefined;

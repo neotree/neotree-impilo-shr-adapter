@@ -8,14 +8,12 @@ import type {
   CodeableConcept,
 } from '../../shared/types/fhir.types';
 import { NeotreePatientData } from '../../shared/types/neotree.types';
-import { getConfig } from '../../shared/config';
 import { getLogger } from '../../shared/utils/logger';
 import { TransformationError } from '../../shared/utils/errors';
 
 const logger = getLogger('condition-translator');
 
 export class ConditionTranslator {
-  private config = getConfig();
 
   /**
    * Translate Neotree diagnoses to FHIR Condition resources
@@ -23,7 +21,9 @@ export class ConditionTranslator {
   translate(
     data: NeotreePatientData,
     patientReference: string,
-    encounterReference?: string
+    encounterReference?: string,
+    facilityId?: string,
+    sourceId?: string
   ): FHIRCondition[] {
     try {
       logger.debug({ uid: data.uid }, 'Translating conditions to FHIR');
@@ -39,7 +39,9 @@ export class ConditionTranslator {
               patientReference,
               encounterReference,
               diagnosis,
-              index
+              index,
+              facilityId,
+              sourceId
             )
           );
         }
@@ -67,16 +69,22 @@ export class ConditionTranslator {
     patientReference: string,
     encounterReference: string | undefined,
     diagnosis: string,
-    index: number
+    index: number,
+    facilityId?: string,
+    sourceId?: string
   ): FHIRCondition {
+    const conditionId = this.generateConditionId(data.uid, diagnosis, index);
     const condition: FHIRCondition = {
       resourceType: 'Condition',
-      meta: {
-        source: `${this.config.source.id}/${this.config.source.facilityId}`,
-      },
+      id: conditionId,
+      meta: sourceId
+        ? {
+            source: facilityId ? `${sourceId}/${facilityId}` : sourceId,
+          }
+        : undefined,
       identifier: [
         {
-          system: `urn:oid:${this.config.source.facilityId}:neotree:condition`,
+          system: facilityId ? `urn:oid:${facilityId}:neotree:condition` : undefined,
           value: `condition-${data.uniqueKey}-${index}`,
         },
       ],
@@ -134,6 +142,20 @@ export class ConditionTranslator {
     }
 
     return condition;
+  }
+
+  private generateConditionId(uid: string, diagnosis: string, index: number): string {
+    const normalized = this.normalizeFhirId(diagnosis);
+    return `${uid}-diagnosis-${index}-${normalized}`;
+  }
+
+  private normalizeFhirId(value: string): string {
+    const base = value
+      .toLowerCase()
+      .replace(/[^a-z0-9.-]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .replace(/-+/g, '-');
+    return base ? base.slice(0, 32) : 'unknown';
   }
 
   /**

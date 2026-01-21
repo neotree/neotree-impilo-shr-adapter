@@ -67,7 +67,8 @@ RETURNS TABLE(
   ingested_at TIMESTAMP,
   session_time TIMESTAMP,
   impilo_uid UUID,
-  data JSONB
+  impilo_id TEXT,
+  data TEXT
 ) AS $$
 DECLARE
   last_watermark TIMESTAMP;
@@ -110,6 +111,7 @@ BEGIN
       s.ingested_at,
       %s as session_time,
       %s as impilo_uid,
+      s.impilo_id,
       s.data
     FROM %I s
     WHERE s.ingested_at > $1

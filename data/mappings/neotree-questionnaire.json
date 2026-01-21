@@ -1,0 +1,14 @@
+{
+  "id": "neotree-unmapped-fields",
+  "url": "http://neotree.local/fhir/Questionnaire/neotree-unmapped-fields",
+  "version": "1.0.0",
+  "title": "Neotree Unmapped Fields",
+  "description": "Generic fallback for unmapped Neotree keys. Uses neonatal-question linkIds for consistent downstream handling.",
+  "questions": [],
+  "genericQuestion": {
+    "linkIdPrefix": "neonatal-question-",
+    "textTemplate": "Neonatal question: {key}",
+    "type": "string",
+    "group": "neonatal-question"
+  }
+}

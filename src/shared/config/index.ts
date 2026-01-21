@@ -28,8 +28,8 @@ const ConfigSchema = z.object({
   // Source Identification
   source: z.object({
     id: z.string(),
-    facilityId: z.string(),
-    facilityName: z.string(),
+    facilityId: z.string().optional(), // Auto-generated from impilo_id, not required
+    facilityName: z.string().optional(),
   }),
 
   // OpenHIM Configuration
@@ -57,6 +57,7 @@ const ConfigSchema = z.object({
   // Security
   security: z.object({
     encryptionKey: z.string().length(32),
+    impiloEncryptionSecret: z.string().length(32),
   }),
 
   // Retry Configuration
@@ -113,6 +114,7 @@ export function loadConfig(): Config {
 
     security: {
       encryptionKey: process.env.ENCRYPTION_KEY || 'CHANGE_THIS_TO_32_CHAR_STRING!',
+      impiloEncryptionSecret: process.env.IMPILO_ENCRYPTION_SECRET || 'CHANGE_THIS_TO_32_CHAR_STRING!',
     },
 
     retry: {
