@@ -82,10 +82,41 @@ export class OpenHIMClient {
   }
 
   /**
+   * Send single resource to CR endpoint, using PUT with resource id when available
+   */
+  async sendResourceToCR(resource: FHIRResource): Promise<{ resource: FHIRResource; status: number; endpoint: string }> {
+    return this.sendResourceToEndpointWithLogging(resource, this.config.openhim.crEndpoint, 'cr');
+  }
+
+  /**
    * Send single resource to SHR endpoint, using PUT with resource id when available
    */
   async sendResourceToSHR(resource: FHIRResource): Promise<{ resource: FHIRResource; status: number; endpoint: string }> {
     return this.sendResourceToEndpointWithLogging(resource, this.config.openhim.shrEndpoint, 'shr');
+  }
+
+  async getObservationsBySubjectIdentifier(
+    identifierSystem: string,
+    identifierValue: string
+  ): Promise<{ url: string; data: FHIRBundle }> {
+    const endpoint = `${this.config.openhim.shrEndpoint}/Observation`;
+    const authHeaders = this.generateAuthHeaders();
+    const encodedSystem = encodeURIComponent(identifierSystem);
+    const encodedValue = encodeURIComponent(identifierValue);
+    const url = `${this.config.openhim.baseUrl}${endpoint}?subject.identifier=${encodedSystem}|${encodedValue}`;
+
+    const response = await this.client.get<FHIRBundle>(endpoint, {
+      params: {
+        'subject.identifier': `${identifierSystem}|${identifierValue}`,
+      },
+      headers: {
+        ...authHeaders,
+        'X-OpenHIM-ClientID': this.config.openhim.clientId || this.config.source.id,
+        'X-Forwarded-For': 'neotree-adapter',
+      },
+    });
+
+    return { url, data: response.data };
   }
 
   async getPatientEverythingFromSHR(patientId: string): Promise<unknown> {

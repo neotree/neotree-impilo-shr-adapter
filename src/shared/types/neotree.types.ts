@@ -5,6 +5,7 @@
 
 export interface NeotreeEntry {
   uid: string;
+  impilo_id?: string;
   impilo_uid?: string;
   appEnv: string;
   script?: {
@@ -49,6 +50,7 @@ export interface Diagnosis {
 export interface NeotreePatientData {
   // Patient identifiers
   uid: string;
+  impilo_id?: string; // Decrypted impilo_id (used for urn:neotree:impilo-id)
   impilo_uid?: string;
   person_id?: string; // Facility-specific person ID (nfor)
   uniqueKey: string;

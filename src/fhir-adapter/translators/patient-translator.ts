@@ -9,6 +9,7 @@ import type {
   Identifier,
 } from '../../shared/types/fhir.types';
 import { NeotreePatientData } from '../../shared/types/neotree.types';
+import { v4 as uuidv4 } from 'uuid';
 import { TransformationError } from '../../shared/utils/errors';
 import { getLogger } from '../../shared/utils/logger';
 
@@ -65,39 +66,46 @@ export class PatientTranslator {
   /**
    * Build patient identifiers
    * Priority order (per FHIR mapping documentation):
-   * 1. Primary: impilo_neotree_id → urn:neotree:impilo-id
-   * 2. Secondary: impilo_uid → urn:impilo:uid
-   * 3. Tertiary: person_id → urn:impilo:person-id (facility-specific, nfor)
-   *    - Falls back to impilo_uid if person_id not provided
+   * 1. Primary: impilo_id (decrypted) → urn:neotree:impilo-id
+   * 2. Secondary: person_id → urn:impilo:person-id (UUID)
+   * 3. Tertiary: impilo_uid → urn:impilo:uid (UUID)
+   *    - If impilo_uid is missing or invalid, generate a UUID
+   *    - If person_id is missing or invalid, generate a UUID (distinct from impilo_uid)
    */
   private buildIdentifiers(data: NeotreePatientData): Identifier[] {
     const identifiers: Identifier[] = [];
 
-    // Primary identifier: Neotree Patient ID (highest priority)
+    // Primary identifier: Impilo ID (from DB), fallback to Neotree UID
     identifiers.push({
       system: 'urn:neotree:impilo-id',
-      value: data.uid,
+      value: data.impilo_id || data.uid,
     });
 
-    // Secondary identifier: Impilo UID (UUID)
-    if (data.impilo_uid) {
-      identifiers.push({
-        system: 'urn:impilo:uid',
-        value: data.impilo_uid,
-      });
+    const impiloUid = this.ensureUuid(data.impilo_uid);
+    data.impilo_uid = impiloUid;
+    let personId = this.ensureUuid(data.person_id);
+    if (personId === impiloUid) {
+      personId = uuidv4();
     }
+    data.person_id = personId;
 
-    // Tertiary identifier: Person ID (facility-specific, nfor)
-    // Falls back to impilo_uid if person_id not provided
-    const personId = data.person_id || data.impilo_uid;
-    if (personId) {
-      identifiers.push({
-        system: 'urn:impilo:person-id',
-        value: personId,
-      });
-    }
+    identifiers.push({
+      system: 'urn:impilo:person-id',
+      value: personId,
+    });
+    identifiers.push({
+      system: 'urn:impilo:uid',
+      value: impiloUid,
+    });
 
     return identifiers;
+  }
+
+  private ensureUuid(value?: string): string {
+    if (value && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)) {
+      return value;
+    }
+    return uuidv4();
   }
 
   /**

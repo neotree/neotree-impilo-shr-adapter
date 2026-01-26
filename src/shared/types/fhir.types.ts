@@ -101,6 +101,15 @@ export interface FHIRPatient extends FHIRResource {
   managingOrganization?: Reference;
 }
 
+export interface FHIROrganization extends FHIRResource {
+  resourceType: 'Organization';
+  active?: boolean;
+  name?: string;
+  type?: CodeableConcept[];
+  telecom?: ContactPoint[];
+  address?: Address[];
+}
+
 export interface PatientContact {
   relationship?: CodeableConcept[];
   name?: HumanName;

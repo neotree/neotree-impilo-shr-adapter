@@ -44,7 +44,7 @@ export class CDCService {
   private adapterService: AdapterService;
   private isPolling = false;
   private pollCronSchedule = '*/5 * * * * *'; // Every 5 seconds
-  private retryCronSchedule = '*/5 * * * *'; // Every 5 minutes
+  private retryCronSchedule = '*/2 * * * *'; // Default; overwritten by config in constructor
   private pollTask: cron.ScheduledTask | null = null;
   private retryTask: cron.ScheduledTask | null = null;
   private batchSize = 100;
@@ -52,6 +52,7 @@ export class CDCService {
 
   constructor(adapterService: AdapterService) {
     this.adapterService = adapterService;
+    this.retryCronSchedule = this.config.retry.cron;
   }
 
   async start(): Promise<void> {
@@ -130,6 +131,7 @@ export class CDCService {
       let shrSynced = false;
       let decryptedData: Record<string, unknown> | null = null;
       let decryptedImpiloId: string | null = null;
+      let decryptedImpiloUid: string | null = null;
       let encryptedImpiloId: string | null = null;
       let encryptedDataStr: string | null = null;
 
@@ -150,6 +152,7 @@ export class CDCService {
               encryptedDataStr
             );
             decryptedImpiloId = decryptedRecord.impiloId;
+            decryptedImpiloUid = record.impilo_uid || null;
             decryptedData = decryptedRecord.data;
             logger.debug({ sessionId: record.id }, 'Successfully decrypted DB_SOURCE_TABLE record');
           } catch (decryptError) {
@@ -165,7 +168,8 @@ export class CDCService {
         } else {
           // Data is already decrypted or plain - parse JSON string
           decryptedData = JSON.parse(record.data);
-          decryptedImpiloId = record.impilo_uid || null;
+          decryptedImpiloId = record.impilo_id || null;
+          decryptedImpiloUid = record.impilo_uid || null;
         }
 
         // Step 2: Validate decrypted data before conversion
@@ -174,7 +178,11 @@ export class CDCService {
         }
 
         // Step 3: Convert to NeotreeEntry
-        const entry = this.convertToNeotreeEntry(decryptedData as Record<string, unknown>, decryptedImpiloId || undefined);
+        const entry = this.convertToNeotreeEntry(
+          decryptedData as Record<string, unknown>,
+          decryptedImpiloId || undefined,
+          decryptedImpiloUid || undefined
+        );
 
         // Phase 1: CR Push (with dual-flow that can fail partially)
         try {
@@ -436,6 +444,7 @@ export class CDCService {
    */
   private convertToNeotreeEntry(
     data: Record<string, unknown>,
+    impilo_id?: string,
     impilo_uid?: string
   ): NeotreeEntry {
     if (!data || typeof data !== 'object') {
@@ -450,6 +459,9 @@ export class CDCService {
 
     const entry = payload as NeotreeEntry;
 
+    if (impilo_id) {
+      entry.impilo_id = impilo_id;
+    }
     if (impilo_uid) {
       entry.impilo_uid = impilo_uid;
     }

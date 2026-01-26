@@ -19,8 +19,8 @@ const SCRIPT_TITLE = 'Sally Mugabe CH Admission';
 const HOSPITAL_ID = '-MZm_dIkquPzKnJl-tbM';
 
 // Sample data pools
-const FIRST_NAMES = ['John', 'Mary', 'David', 'Sarah', 'Michael', 'Elizabeth', 'James', 'Jennifer', 'Robert', 'Linda','Karlos','Khedha','Taflo'];
-const LAST_NAMES = ['Smith', 'Johnson', 'Williams', 'Brown', 'Jones', 'Garcia', 'Miller', 'Davis', 'Rodriguez', 'Martinez','Mutiro','Magwaza','Endby'];
+const FIRST_NAMES = ['John', 'Mary', 'David', 'Sarah', 'Michael', 'Elizabeth', 'James', 'Jennifer', 'Robert', 'Linda','Karlos','Khedha','Taflo','Elijah','Trynos','Jelin','Seed','Alonso'];
+const LAST_NAMES = ['Smith', 'Johnson', 'Williams', 'Brown', 'Jones', 'Garcia', 'Miller', 'Davis', 'Rodriguez', 'Martinez','Mutiro','Magwaza','Endby','Mwendamberi','Kumbirai','Doe','Cop','Xabi'];
 const GENDERS = ['M', 'F'] as const;
 const PROVINCES = [
   { label: 'Harare', value: 'HA' },

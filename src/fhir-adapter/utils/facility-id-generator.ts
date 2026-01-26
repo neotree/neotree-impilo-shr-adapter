@@ -18,6 +18,7 @@ export class FacilityIdGenerator {
    * @throws Error if impilo_id is invalid or missing required segments
    */
   static generateFromImpiloId(impiloId: string | null | undefined): string {
+    console.log("#######################FID######",impiloId)
     if (!impiloId || typeof impiloId !== 'string') {
       throw new Error('impilo_id is required and must be a non-empty string');
     }

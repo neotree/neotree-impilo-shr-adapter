@@ -76,10 +76,15 @@ export class EncounterTranslator {
       logger.debug({ uid: data.uid, scriptId }, 'Encounter resource translated successfully for SHR');
       return encounter;
     } catch (error) {
-      logger.error({ error, uid: data.uid }, 'Failed to translate encounter data');
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      const errorStack = error instanceof Error ? error.stack : undefined;
+      logger.error(
+        { error: errorMessage, stack: errorStack, uid: data.uid, scriptId },
+        'Failed to translate encounter data'
+      );
       throw new TransformationError('Failed to translate encounter data to FHIR', {
         uid: data.uid,
-        error: String(error),
+        error: errorMessage,
       });
     }
   }
@@ -247,7 +252,8 @@ export class EncounterTranslator {
    * Includes static admission reason plus dynamically mapped reason codes
    */
   private buildReasonCodes(data: NeotreePatientData, facilityId?: string): CodeableConcept[] | undefined {
-    if (!data.admissionReason && data.diagnoses.length === 0) {
+    const diagnoses = Array.isArray(data.diagnoses) ? data.diagnoses : [];
+    if (!data.admissionReason && diagnoses.length === 0) {
       // Check if there are dynamic reason mappings
       const dynamicReasons = this.buildDynamicReasonCodes(data, facilityId);
       return dynamicReasons.length > 0 ? dynamicReasons : undefined;

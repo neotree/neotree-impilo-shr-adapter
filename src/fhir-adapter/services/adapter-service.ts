@@ -1,5 +1,5 @@
-import { NeotreeEntry } from '../../shared/types/neotree.types';
-import { FHIRBundle, FHIRPatient, FHIRResource } from '../../shared/types/fhir.types';
+import { NeotreeEntry, NeotreePatientData } from '../../shared/types/neotree.types';
+import { FHIRBundle, FHIRPatient, FHIRResource, FHIROrganization } from '../../shared/types/fhir.types';
 import { mapNeotreeToPatientData } from '../mappers/neotree-mapper';
 import { PatientTranslator } from '../translators/patient-translator';
 import { EncounterTranslator } from '../translators/encounter-translator';
@@ -12,7 +12,9 @@ import { OpenHIMClient } from '../clients/openhim-client';
 import { SyncService } from './sync-service';
 import { DBDecryptionService } from './db-decryption-service';
 import { FacilityIdGenerator } from '../utils/facility-id-generator';
+import { getFacilityMapperService } from './facility-mapper-service';
 import { getLogger } from '../../shared/utils/logger';
+import { AxiosError } from 'axios';
 import { getJsonFileLogger } from '../../shared/utils/json-file-logger';
 import { AdapterError, handleError } from '../../shared/utils/errors';
 import { validateAllResources } from '../utils/validation';
@@ -22,6 +24,7 @@ import { Pool } from 'pg';
 import { getPool } from '../../shared/database/pool';
 import { v4 as uuidv4 } from 'uuid';
 import { getConfig } from '../../shared/config';
+import e from 'express';
 
 const logger = getLogger('adapter-service');
 const jsonLogger = getJsonFileLogger();
@@ -59,6 +62,7 @@ export class AdapterService {
   private duplicateDetection: DuplicateDetectionService;
   private missingDataHandler: MissingDataHandler;
   private pool: Pool;
+  private facilityMapper = getFacilityMapperService();
 
   constructor() {
     this.openhimClient = new OpenHIMClient();
@@ -75,7 +79,7 @@ export class AdapterService {
 
   private async pushShrResources(
     resources: FHIRResource[],
-    context: { uid: string; impiloUid?: string }
+    context: { uid: string; impiloUid?: string; impiloId?: string }
   ): Promise<SHRPushResult[]> {
     const results: SHRPushResult[] = [];
 
@@ -93,6 +97,27 @@ export class AdapterService {
           endpoint: response.endpoint,
         });
       } catch (error) {
+        const httpStatus = error instanceof AxiosError ? error.response?.status : undefined;
+        const diagnostics = (error instanceof AxiosError ? (error.response?.data as { issue?: Array<{ diagnostics?: string }> } | undefined)?.issue?.[0]?.diagnostics : undefined) || '';
+        const isVersionConflict = diagnostics.includes('version constraint failure');
+        if (httpStatus === 409 || httpStatus === 412 || isVersionConflict) {
+          logger.warn(
+            {
+              uid: context.uid,
+              impiloUid: context.impiloUid,
+              resourceType: resource.resourceType,
+              resourceId: resource.id,
+            },
+            'SHR version conflict - treating as success'
+          );
+          results.push({
+            resourceType: resource.resourceType,
+            id: resource.id,
+            status: httpStatus || 409,
+            endpoint: `${this.config.openhim.shrEndpoint}/${resource.resourceType}/${resource.id || ''}`,
+          });
+          continue;
+        }
         logger.error(
           {
             uid: context.uid,
@@ -117,6 +142,7 @@ export class AdapterService {
     void patientReference;
     void context;
   }
+
 
   /**
    * Process encrypted entry from failed records table with dual-flow support
@@ -165,6 +191,19 @@ export class AdapterService {
       decryptedImpiloId = decryptedSyncData.impiloId;
       decryptedData = decryptedSyncData.data;
 
+      // Log decrypted metadata without the data column for debugging
+      logger.info(
+        {
+          recordId: record.id,
+          sessionId: record.session_id,
+          impiloId: decryptedImpiloId,
+          crSynced: record.cr_synced,
+          shrSynced: record.shr_synced,
+          attemptCount: record.attempt_count,
+        },
+        'Decrypted failed record metadata (excluding data payload)'
+      );
+
       // Step 2: Generate FACILITY_ID from decrypted impilo_id for CR push
       let facilityId: string | null = null;
       try {
@@ -177,15 +216,22 @@ export class AdapterService {
       }
 
       // Step 3: Format the data
-      let patientData;
+      let patientData: NeotreePatientData;
       if (typeof decryptedData === 'object' && decryptedData !== null && 'script' in decryptedData) {
         neotreeEntry = decryptedData as NeotreeEntry;
         patientData = mapNeotreeToPatientData(neotreeEntry, facilityId || undefined);
       } else {
-        patientData = decryptedData as unknown;
+        patientData = decryptedData as NeotreePatientData;
       }
       if (facilityId) {
         (patientData as { facilityId?: string }).facilityId = facilityId;
+      }
+      patientData.impilo_id = decryptedImpiloId;
+      const facilityName = patientData.scriptId
+        ? this.facilityMapper.getFacilityName(patientData.scriptId)
+        : facilityId || 'Unknown Facility';
+      if (facilityId) {
+        await this.ensureOrganizationExists(facilityId, facilityName);
       }
 
       // Step 4: Phase 1 - Client Registry (if not already synced)
@@ -242,16 +288,17 @@ export class AdapterService {
           // We need the patient bundle ID from CR for clinical data linkage
           // Try to retrieve patient using impilo_id first (more reliable), then fallback to uid
           const neotreeIdentifierSystem = `urn:neotree:impilo-id`;
+          const primaryIdentifierValue = patientData.impilo_id || patientData.uid;
           let crResponse = null;
 
-          if (decryptedImpiloId) {
+          if (primaryIdentifierValue) {
             try {
-              logger.debug({ recordId: record.id, impiloId: decryptedImpiloId }, 'Searching for patient in CR using impilo_id');
-              crResponse = await this.openhimClient.getPatientFromCR(neotreeIdentifierSystem, decryptedImpiloId);
-              logger.debug({ recordId: record.id, bundleId: crResponse?.bundleId, hasPatient: !!crResponse?.patient }, 'CR response received')
+              logger.debug({ recordId: record.id, impiloId: primaryIdentifierValue }, 'Searching for patient in CR using impilo_id');
+              crResponse = await this.openhimClient.getPatientFromCR(neotreeIdentifierSystem, primaryIdentifierValue);
+              logger.debug({ recordId: record.id, bundleId: crResponse?.bundleId, hasPatient: !!crResponse?.patient }, 'CR response received');
             } catch (impiloSearchError) {
               logger.warn(
-                { recordId: record.id, impiloId: decryptedImpiloId, error: impiloSearchError instanceof Error ? impiloSearchError.message : String(impiloSearchError) },
+                { recordId: record.id, impiloId: primaryIdentifierValue, error: impiloSearchError instanceof Error ? impiloSearchError.message : String(impiloSearchError) },
                 'Failed to search CR using impilo_id, attempting fallback with uid'
               );
             }
@@ -259,7 +306,7 @@ export class AdapterService {
 
       // Fallback to uid if impilo_id search failed
       if (!crResponse) {
-        const neotreeIdentifier = (patientData as any).uid;
+        const neotreeIdentifier = patientData.uid;
         logger.debug({ recordId: record.id, uid: neotreeIdentifier }, 'Searching for patient in CR using uid');
         crResponse = await this.openhimClient.getPatientFromCR(neotreeIdentifierSystem, neotreeIdentifier);
       }
@@ -283,10 +330,12 @@ export class AdapterService {
           // ===== SHARED HEALTH RECORD FLOW - PHASE 1: SHALLOW PATIENT =====
           // Post shallow patient record to SHR before sending clinical data
           let shrPatientId: string | undefined;
+          let shallowPatientReference: string | undefined;
           try {
             const shallowPatient = crResponse.patient
               ? this.createShallowPatientFromCR(crResponse.patient)
               : this.createShallowPatientFromEntry(patientData, crResponse.bundleId, facilityId || undefined);
+            shallowPatientReference = shallowPatient.id ? `Patient/${shallowPatient.id}` : undefined;
             logger.debug(
               { recordId: record.id, bundleId: crResponse.bundleId },
               'Creating shallow patient for SHR'
@@ -306,7 +355,9 @@ export class AdapterService {
           }
 
           // ===== SHARED HEALTH RECORD FLOW - PHASE 2: CLINICAL DATA =====
-          const patientReference = `Patient/${shrPatientId || crResponse.bundleId}`;
+          const patientReference = shrPatientId
+            ? `Patient/${shrPatientId}`
+            : shallowPatientReference || `Patient/${crResponse.bundleId}`;
           const encounterId = uuidv4();
           const encounterReference = `Encounter/${encounterId}`;
           const scriptId = (patientData as any).scriptId;
@@ -345,6 +396,7 @@ export class AdapterService {
           await this.pushShrResources(shrResources, {
             uid: neotreeEntry?.uid || 'unknown',
             impiloUid: decryptedImpiloId,
+            impiloId: patientData.impilo_id,
           });
           await this.logShrPatientRecord(patientReference, {
             uid: neotreeEntry?.uid || 'unknown',
@@ -386,22 +438,34 @@ export class AdapterService {
       if (!entry.script) {
         throw new Error(`Missing script data for entry ${entry.uid}`);
       }
-
       let facilityId: string | undefined;
-      if (entry.impilo_uid) {
+      const facilitySourceId = entry.impilo_id || entry.impilo_uid;
+      if (facilitySourceId) {
         try {
-          facilityId = FacilityIdGenerator.generateFromImpiloId(entry.impilo_uid);
-          logger.debug({ uid: entry.uid, impiloUid: entry.impilo_uid, facilityId }, 'Generated FACILITY_ID from impilo_uid');
+          facilityId = FacilityIdGenerator.generateFromImpiloId(facilitySourceId);
+          logger.debug(
+            { uid: entry.uid, impiloId: entry.impilo_id, impiloUid: entry.impilo_uid, facilityId },
+            'Generated FACILITY_ID from impilo_id'
+          );
         } catch (error) {
           logger.warn(
-            { uid: entry.uid, impiloUid: entry.impilo_uid, error: error instanceof Error ? error.message : String(error) },
-            'Failed to generate FACILITY_ID from impilo_uid'
+            { uid: entry.uid, impiloId: entry.impilo_id, impiloUid: entry.impilo_uid, error: error instanceof Error ? error.message : String(error) },
+            'Failed to generate FACILITY_ID from impilo_id'
           );
         }
       }
 
       const patientData = mapNeotreeToPatientData(entry, facilityId);
       patientData.facilityId = facilityId;
+      if (entry.impilo_id) {
+        patientData.impilo_id = entry.impilo_id;
+      }
+      const facilityName = entry.script?.id
+        ? this.facilityMapper.getFacilityName(entry.script.id)
+        : facilityId || 'Unknown Facility';
+      if (facilityId) {
+        await this.ensureOrganizationExists(facilityId, facilityName);
+      }
       const validation = validateAllResources(patientData);
 
       if (!validation.canProceed) {
@@ -494,6 +558,18 @@ export class AdapterService {
       }
 
       const patientData = mapNeotreeToPatientData(entry);
+      if (entry.impilo_id) {
+        patientData.impilo_id = entry.impilo_id;
+      }
+      const retryFacilityId = entry.impilo_id || entry.impilo_uid
+        ? FacilityIdGenerator.generateFromImpiloId(entry.impilo_id || entry.impilo_uid)
+        : undefined;
+      const facilityName = entry.script?.id
+        ? this.facilityMapper.getFacilityName(entry.script.id)
+        : retryFacilityId || 'Unknown Facility';
+      if (retryFacilityId) {
+        await this.ensureOrganizationExists(retryFacilityId, facilityName);
+      }
       const validation = validateAllResources(patientData);
 
       if (!validation.canProceed) {
@@ -511,30 +587,30 @@ export class AdapterService {
       const neotreeIdentifierSystem = `urn:neotree:impilo-id`;
       let crResponse = null;
 
-      // Try to retrieve patient using impilo_uid first (more reliable), then fallback to uid
-      if (entry.impilo_uid) {
+      const primaryIdentifierValue = patientData.impilo_id || patientData.uid;
+      if (primaryIdentifierValue) {
         try {
           logger.debug(
-            { uid: entry.uid, impiloUid: entry.impilo_uid },
-            'Searching for patient in CR using impilo_uid'
+            { uid: entry.uid, impiloId: primaryIdentifierValue },
+            'Searching for patient in CR using impilo_id'
           );
           crResponse = await this.openhimClient.getPatientFromCR(
             neotreeIdentifierSystem,
-            entry.impilo_uid
+            primaryIdentifierValue
           );
         } catch (error) {
           logger.warn(
             {
               uid: entry.uid,
-              impiloUid: entry.impilo_uid,
+              impiloId: primaryIdentifierValue,
               error: error instanceof Error ? error.message : String(error),
             },
-            'Failed to retrieve patient from CR using impilo_uid, attempting fallback with uid'
+            'Failed to retrieve patient from CR using impilo_id, attempting fallback with uid'
           );
         }
       }
 
-      // Fallback to uid if impilo_uid search failed
+      // Fallback to uid if impilo_id search failed
       if (!crResponse) {
         const neotreeIdentifier = patientData.uid;
         try {
@@ -620,6 +696,7 @@ export class AdapterService {
       const shrResponse = await this.pushShrResources(shrResources, {
         uid: entry.uid,
         impiloUid: entry.impilo_uid,
+        impiloId: patientData.impilo_id,
       });
       await this.logShrPatientRecord(patientReference, {
         uid: entry.uid,
@@ -664,11 +741,18 @@ export class AdapterService {
         throw new Error(`Missing script data for entry ${entry.uid}`);
       }
 
-      // Generate FACILITY_ID from impilo_uid
+      // Generate FACILITY_ID from impilo_id (fallback to impilo_uid)
       let facilityId: string;
       try {
-        facilityId = FacilityIdGenerator.generateFromImpiloId(entry.impilo_uid);
-        logger.debug({ uid: entry.uid, impiloUid: entry.impilo_uid, facilityId }, 'Generated FACILITY_ID from impilo_uid');
+        const facilitySourceId = entry.impilo_id || entry.impilo_uid;
+        if (!facilitySourceId) {
+          throw new Error('Missing impilo_id for facility mapping');
+        }
+        facilityId = FacilityIdGenerator.generateFromImpiloId(facilitySourceId);
+        logger.debug(
+          { uid: entry.uid, impiloId: entry.impilo_id, impiloUid: entry.impilo_uid, facilityId },
+          'Generated FACILITY_ID from impilo_id'
+        );
       } catch (error) {
         throw new Error(
           `Cannot process entry: ${error instanceof Error ? error.message : String(error)}. ` +
@@ -677,6 +761,9 @@ export class AdapterService {
       }
 
       const patientData = mapNeotreeToPatientData(entry, facilityId);
+      if (entry.impilo_id) {
+        patientData.impilo_id = entry.impilo_id;
+      }
       const validation = validateAllResources(patientData);
 
       if (!validation.canProceed) {
@@ -688,6 +775,8 @@ export class AdapterService {
       logger.info({ uid: entry.uid, facilityId }, 'Processing entry with dual-flow (CR + SHR)');
 
       // ===== CLIENT REGISTRY FLOW (Demographics) =====
+      const facilityName = this.facilityMapper.getFacilityName(entry.script.id);
+      await this.ensureOrganizationExists(facilityId, facilityName);
       const patient = this.patientTranslator.translate(patientData, facilityId);
 
       // Check missing data for patient
@@ -777,20 +866,22 @@ export class AdapterService {
         // After CR push succeeds, retrieve the patient bundle ID to use for SHR resources
         const neotreeIdentifierSystem = `urn:neotree:impilo-id`;
         let crSearchResponse = null;
+        const primaryIdentifierValue =
+          finalPatient.identifier?.[0]?.value || patientData.impilo_id || entry.uid;
 
-        if (entry.impilo_uid) {
+        if (primaryIdentifierValue) {
           try {
-            logger.debug({ uid: entry.uid, impiloUid: entry.impilo_uid }, 'Retrieving patient bundle ID from CR for SHR linkage');
-            crSearchResponse = await this.openhimClient.getPatientFromCR(neotreeIdentifierSystem, entry.impilo_uid);
+            logger.debug({ uid: entry.uid, impiloId: primaryIdentifierValue }, 'Retrieving patient bundle ID from CR for SHR linkage');
+            crSearchResponse = await this.openhimClient.getPatientFromCR(neotreeIdentifierSystem, primaryIdentifierValue);
           } catch (error) {
             logger.warn(
-              { uid: entry.uid, impiloUid: entry.impilo_uid, error: error instanceof Error ? error.message : String(error) },
+              { uid: entry.uid, impiloId: primaryIdentifierValue, error: error instanceof Error ? error.message : String(error) },
               'Failed to retrieve patient bundle from CR, attempting fallback with uid'
             );
           }
         }
 
-        // Fallback to uid if impilo_uid search failed
+        // Fallback to uid if impilo_id search failed
         if (!crSearchResponse) {
           try {
             logger.debug({ uid: entry.uid }, 'Retrieving patient bundle ID from CR using uid for SHR linkage');
@@ -824,10 +915,12 @@ export class AdapterService {
         // ===== SHARED HEALTH RECORD FLOW - PHASE 1: SHALLOW PATIENT =====
         // Post shallow patient record to SHR before sending clinical data
         let shrPatientId: string | undefined;
+        let shallowPatientReference: string | undefined;
         try {
           const shallowPatient = crSearchResponse.patient
             ? this.createShallowPatientFromCR(crSearchResponse.patient)
             : this.createShallowPatientFromEntry(patientData, crSearchResponse.bundleId, facilityId);
+          shallowPatientReference = shallowPatient.id ? `Patient/${shallowPatient.id}` : undefined;
           logger.debug(
             { uid: entry.uid, bundleId: crSearchResponse.bundleId },
             'Creating shallow patient for SHR'
@@ -846,8 +939,10 @@ export class AdapterService {
         }
 
         // ===== SHARED HEALTH RECORD FLOW - PHASE 2: CLINICAL DATA =====
-        // Build patient reference for SHR resources using the CR bundle ID
-        const patientReference = `Patient/${shrPatientId || crSearchResponse.bundleId}`;
+        // Build patient reference for SHR resources using the same patient sent to SHR
+        const patientReference = shrPatientId
+          ? `Patient/${shrPatientId}`
+          : shallowPatientReference || `Patient/${crSearchResponse.bundleId}`;
         const encounterId = uuidv4();
         const encounterReference = `Encounter/${encounterId}`;
         const dualFlowScriptId = patientData.scriptId;
@@ -895,6 +990,7 @@ export class AdapterService {
         const shrResponse = await this.pushShrResources(shrResources, {
           uid: entry.uid,
           impiloUid: entry.impilo_uid,
+          impiloId: patientData.impilo_id,
         });
         await this.logShrPatientRecord(patientReference, {
           uid: entry.uid,
@@ -940,20 +1036,18 @@ export class AdapterService {
    * Used for demonstration: POST shallow patient before sending clinical data to SHR
    *
    * Includes:
-   * - All identifiers from CR (urn:neotree:impilo-id, urn:impilo:uid, urn:impilo:person-id)
+   * - All identifiers from CR (urn:neotree:impilo-id, urn:impilo:person-id, urn:impilo:uid)
    * - Names, gender, and birthDate demographics
    *
    * @param crPatient Full patient resource from Client Registry
    * @returns Shallow patient FHIR resource for SHR
    */
   private createShallowPatientFromCR(crPatient: any): any {
-    const impiloUidIdentifier = (crPatient.identifier || []).find(
-      (identifier: { system?: string }) => identifier.system === 'urn:impilo:uid'
-    );
+    const facilityId = this.extractFacilityIdFromManagingOrganization(crPatient);
     const shallowPatient: any = {
       resourceType: 'Patient',
       id: crPatient.id,
-      identifier: impiloUidIdentifier ? [impiloUidIdentifier] : [],
+      identifier: crPatient.identifier || [],
     };
 
     // Include name(s) from CR
@@ -964,6 +1058,34 @@ export class AdapterService {
     // Include gender from CR
     if (crPatient.gender) {
       shallowPatient.gender = crPatient.gender;
+    }
+
+    // Include birthDate from CR
+    if (crPatient.birthDate) {
+      shallowPatient.birthDate = crPatient.birthDate;
+    }
+
+    const clientIdTag = (crPatient.meta?.tag || []).find(
+      (tag: { system?: string; code?: string }) =>
+        tag.system === 'http://openclientregistry.org/fhir/clientid' && tag.code
+    );
+
+    if (facilityId) {
+      shallowPatient.meta = {
+        tag: [
+          {
+            system: 'http://openclientregistry.org/fhir/clientid',
+            code: facilityId,
+          },
+        ],
+      };
+      shallowPatient.managingOrganization = {
+        reference: `Organization/${facilityId}`,
+      };
+    } else if (clientIdTag) {
+      shallowPatient.meta = { tag: [clientIdTag] };
+    } else if (crPatient.managingOrganization) {
+      shallowPatient.managingOrganization = crPatient.managingOrganization;
     }
 
     logger.debug(
@@ -985,21 +1107,34 @@ export class AdapterService {
    */
   private createShallowPatientFromEntry(patientData: any, bundleId: string, facilityId?: string): FHIRPatient {
     const translatedPatient = this.patientTranslator.translate(patientData as any, facilityId);
-    const impiloUidIdentifier = (translatedPatient.identifier || []).find(
-      (identifier: { system?: string }) => identifier.system === 'urn:impilo:uid'
-    );
     const shallowPatient: FHIRPatient = {
       resourceType: 'Patient',
       id: bundleId,
-      identifier: impiloUidIdentifier ? [impiloUidIdentifier] : [],
+      identifier: translatedPatient.identifier || [],
     };
 
     if (translatedPatient.name && translatedPatient.name.length > 0) {
       shallowPatient.name = translatedPatient.name;
     }
 
-    if (translatedPatient.gender) {
+    if (translatedPatient.gender && translatedPatient.gender !== 'unknown') {
       shallowPatient.gender = translatedPatient.gender;
+    } else if (patientData.gender && patientData.gender !== 'unknown') {
+      shallowPatient.gender = patientData.gender;
+    } else if (translatedPatient.gender) {
+      shallowPatient.gender = translatedPatient.gender;
+    }
+
+    if (translatedPatient.birthDate) {
+      shallowPatient.birthDate = translatedPatient.birthDate;
+    }
+
+    if (translatedPatient.meta) {
+      shallowPatient.meta = translatedPatient.meta;
+    }
+
+    if (translatedPatient.managingOrganization) {
+      shallowPatient.managingOrganization = translatedPatient.managingOrganization;
     }
 
     logger.debug(
@@ -1023,6 +1158,55 @@ export class AdapterService {
     }
     const parts = reference.split('/');
     return parts[parts.length - 1] || undefined;
+  }
+
+  private buildOrganizationResource(facilityId: string, facilityName: string): FHIROrganization {
+    return {
+      resourceType: 'Organization',
+      id: facilityId,
+      identifier: [
+        {
+          system: 'http://health.gov.zw/fhir/organization',
+          value: facilityId,
+        },
+      ],
+      active: true,
+      name: facilityName,
+      type: [
+        {
+          coding: [
+            {
+              system: 'http://terminology.hl7.org/CodeSystem/organization-type',
+              code: 'prov',
+              display: 'Healthcare Provider',
+            },
+          ],
+        },
+      ],
+    };
+  }
+
+  private async ensureOrganizationExists(facilityId: string, facilityName: string): Promise<void> {
+    const organization = this.buildOrganizationResource(facilityId, facilityName);
+    logger.info({ facilityId, facilityName }, 'Ensuring Organization exists in CR and SHR');
+    try {
+      await this.openhimClient.sendResourceToCR(organization);
+    } catch (error) {
+      logger.error(
+        { facilityId, error: error instanceof Error ? error.message : String(error) },
+        'Failed to create Organization in CR'
+      );
+      throw error;
+    }
+    try {
+      await this.openhimClient.sendResourceToSHR(organization);
+    } catch (error) {
+      logger.error(
+        { facilityId, error: error instanceof Error ? error.message : String(error) },
+        'Failed to create Organization in SHR'
+      );
+      throw error;
+    }
   }
 
   /**

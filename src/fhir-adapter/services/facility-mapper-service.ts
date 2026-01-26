@@ -20,7 +20,7 @@ class FacilityMapperService {
 
   constructor() {
     // Load facility mappings from data/mappings/facility-mapper.json
-    this.mapFilePath = path.join(process.cwd(), 'data', 'mappings', 'facility-mapper.json');
+    this.mapFilePath = path.join(process.cwd(), 'config', 'facility-mapper.json');
     this.loadFacilityMappings();
   }
 

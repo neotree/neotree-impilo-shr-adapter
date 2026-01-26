@@ -53,10 +53,15 @@ export class ConditionTranslator {
       );
       return conditions;
     } catch (error) {
-      logger.error({ error, uid: data.uid }, 'Failed to translate condition data');
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      const errorStack = error instanceof Error ? error.stack : undefined;
+      logger.error(
+        { error: errorMessage, stack: errorStack, uid: data.uid },
+        'Failed to translate condition data'
+      );
       throw new TransformationError('Failed to translate condition data to FHIR', {
         uid: data.uid,
-        error: String(error),
+        error: errorMessage,
       });
     }
   }

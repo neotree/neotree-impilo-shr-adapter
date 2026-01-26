@@ -62,6 +62,7 @@ const ConfigSchema = z.object({
 
   // Retry Configuration
   retry: z.object({
+    cron: z.string().default('*/2 * * * *'),
     maxAttempts: z.number().int().positive().default(3),
     backoffMs: z.number().int().positive().default(1000),
   }),
@@ -118,6 +119,7 @@ export function loadConfig(): Config {
     },
 
     retry: {
+      cron: process.env.RETRY_CRON || '*/2 * * * *',
       maxAttempts: parseInt(process.env.MAX_RETRY_ATTEMPTS || '3', 10),
       backoffMs: parseInt(process.env.RETRY_BACKOFF_MS || '1000', 10),
     },
