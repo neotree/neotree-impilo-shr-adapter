@@ -223,6 +223,15 @@ export class AdapterService {
       } else {
         patientData = decryptedData as NeotreePatientData;
       }
+
+      const scriptId = patientData.scriptId || neotreeEntry?.script?.id;
+      if (!scriptId || !this.facilityMapper.hasFacility(scriptId)) {
+        logger.info(
+          { recordId: record.id, sessionId: record.session_id, scriptId },
+          'Skipping failed record retry: scriptId not in facility-mapper'
+        );
+        return;
+      }
       if (facilityId) {
         (patientData as { facilityId?: string }).facilityId = facilityId;
       }
@@ -437,6 +446,14 @@ export class AdapterService {
     try {
       if (!entry.script) {
         throw new Error(`Missing script data for entry ${entry.uid}`);
+      }
+      const scriptId = entry.script?.id;
+      if (!scriptId || !this.facilityMapper.hasFacility(scriptId)) {
+        logger.info(
+          { uid: entry.uid, scriptId },
+          'Skipping entry: scriptId not in facility-mapper'
+        );
+        return { resourceType: 'Bundle', type: 'collection', entry: [] };
       }
       let facilityId: string | undefined;
       const facilitySourceId = entry.impilo_id || entry.impilo_uid;
@@ -739,6 +756,17 @@ export class AdapterService {
     try {
       if (!entry.script) {
         throw new Error(`Missing script data for entry ${entry.uid}`);
+      }
+      const scriptId = entry.script?.id;
+      if (!scriptId || !this.facilityMapper.hasFacility(scriptId)) {
+        logger.info(
+          { uid: entry.uid, scriptId },
+          'Skipping entry: scriptId not in facility-mapper'
+        );
+        return {
+          crResponse: { resourceType: 'Bundle', type: 'collection', entry: [] },
+          shrResponse: [],
+        };
       }
 
       // Generate FACILITY_ID from impilo_id (fallback to impilo_uid)

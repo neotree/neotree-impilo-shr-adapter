@@ -13,6 +13,7 @@ import { getLogger } from '../../shared/utils/logger';
 import { getJsonFileLogger } from '../../shared/utils/json-file-logger';
 import { getConfig } from '../../shared/config';
 import { NeotreeEntry } from '../../shared/types/neotree.types';
+import { getFacilityMapperService } from './facility-mapper-service';
 
 const logger = getLogger('cdc-service');
 const jsonLogger = getJsonFileLogger();
@@ -49,6 +50,7 @@ export class CDCService {
   private retryTask: cron.ScheduledTask | null = null;
   private batchSize = 100;
   private config = getConfig();
+  private facilityMapper = getFacilityMapperService();
 
   constructor(adapterService: AdapterService) {
     this.adapterService = adapterService;
@@ -183,6 +185,16 @@ export class CDCService {
           decryptedImpiloId || undefined,
           decryptedImpiloUid || undefined
         );
+
+        // Step 3b: Skip records whose scriptId is not whitelisted in facility-mapper.json
+        const scriptId = entry.script?.id;
+        if (!scriptId || !this.facilityMapper.hasFacility(scriptId)) {
+          logger.info(
+            { sessionId: record.id, scriptId },
+            'Skipping record: scriptId not in facility-mapper'
+          );
+          continue;
+        }
 
         // Phase 1: CR Push (with dual-flow that can fail partially)
         try {
