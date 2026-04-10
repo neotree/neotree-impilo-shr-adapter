@@ -13,8 +13,7 @@
     "declaration": false,
     "declarationMap": false,
     "sourceMap": false,
-    "moduleResolution": "node",
-    "types": ["node"],
+    "moduleResolution": "node"
   },
   "include": ["src/**/*"],
   "exclude": ["node_modules", "dist", "**/*.test.ts"]
