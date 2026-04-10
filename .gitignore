@@ -13,6 +13,7 @@ coverage/
 !.pgpass.example
 *generated-inserts*
 *generated.*
+.codex
 dist/*
 config/facility-mapper.json
 
