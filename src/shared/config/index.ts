@@ -34,7 +34,7 @@ const ConfigSchema = z.object({
 
   // OpenHIM Configuration
   openhim: z.object({
-    baseUrl: z.string().url(),
+    baseUrl: z.url(),
     username: z.string(),
     password: z.string(),
     channelPath: z.string(),
@@ -123,7 +123,7 @@ export function loadConfig(): Config {
     if (error instanceof z.ZodError) {
       // eslint-disable-next-line no-console
       console.error('Configuration validation failed:');
-      error.errors.forEach((err) => {
+      error.issues.forEach((err) => {
         // eslint-disable-next-line no-console
         console.error(`  - ${err.path.join('.')}: ${err.message}`);
       });
