@@ -81,12 +81,12 @@ export class CDCService {
     this.isPolling = false;
 
     if (this.pollTask) {
-      this.pollTask.stop();
+      await this.pollTask.stop();
       this.pollTask = null;
     }
 
     if (this.retryTask) {
-      this.retryTask.stop();
+      await this.retryTask.stop();
       this.retryTask = null;
     }
 
