@@ -3,13 +3,42 @@
  * Manages database connections with support for .pgpass authentication
  */
 
+import { readFileSync } from 'fs';
 import { Pool, PoolConfig } from 'pg';
-import { getConfig } from '../config';
+import { Config, getConfig } from '../config';
 import { getLogger } from '../utils/logger';
 
 const logger = getLogger('database-pool');
 
 let pool: Pool | null = null;
+
+/**
+ * Build the TLS options for the Postgres connection.
+ * The server certificate is always verified. For a private or self-signed CA,
+ * set DB_SSL_CA to the CA file instead of turning verification off.
+ */
+export function buildSslOptions(
+  database: Pick<Config['database'], 'ssl' | 'sslCa'>
+): PoolConfig['ssl'] {
+  if (!database.ssl) {
+    return false;
+  }
+
+  let ca: string | undefined;
+  if (database.sslCa) {
+    try {
+      ca = readFileSync(database.sslCa, 'utf8');
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      throw new Error(`DB_SSL_CA file could not be read: ${database.sslCa} (${reason})`);
+    }
+  }
+
+  return {
+    rejectUnauthorized: true,
+    ...(ca && { ca }),
+  };
+}
 
 /**
  * Get or create the database connection pool
@@ -25,7 +54,7 @@ export function getPool(): Pool {
       user: config.database.user,
       // Password is optional - will use .pgpass if not provided
       ...(config.database.password && { password: config.database.password }),
-      ssl: config.database.ssl ? { rejectUnauthorized: false } : false,
+      ssl: buildSslOptions(config.database),
       max: 20, // Maximum pool size
       idleTimeoutMillis: 30000,
       connectionTimeoutMillis: 10000,
@@ -55,9 +84,15 @@ export function getPool(): Pool {
         database: config.database.name,
         user: config.database.user,
         usingPgpass: !config.database.password,
+        ssl: config.database.ssl,
+        sslCaConfigured: Boolean(config.database.sslCa),
       },
       'Database connection pool initialized'
     );
+
+    if (config.database.sslCa && !config.database.ssl) {
+      logger.warn('DB_SSL_CA is set but DB_SSL is not true; the CA file is ignored');
+    }
   }
 
   return pool;
