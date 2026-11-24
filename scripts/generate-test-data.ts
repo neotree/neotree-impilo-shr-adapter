@@ -1,12 +1,17 @@
 #!/usr/bin/env ts-node
 /**
- * Generate synthetic test data for source table
+ * Insert synthetic test sessions into the source table.
+ * Connects with the DB_* settings from .env (password from DB_PASSWORD or ~/.pgpass)
+ * and inserts with parameterised queries.
+ *
  * Usage: npx ts-node scripts/generate-test-data.ts [count] [starting-id] [table-name]
  * Example: npx ts-node scripts/generate-test-data.ts 5 497751 sessions
  */
 
 import { randomInt, randomBytes } from 'crypto';
+import { readFileSync } from 'fs';
 import { config as dotenvConfig } from 'dotenv';
+import { Client, ClientConfig, escapeIdentifier } from 'pg';
 
 // Load environment variables
 dotenvConfig();
@@ -278,43 +283,95 @@ function generateTestRecord(id: number) {
     uid,
     impiloUid,
     ingestedAt,
-    data: JSON.stringify(data).replace(/'/g, "''"), // Escape single quotes for SQL
+    data: JSON.stringify(data), // Sent as a query parameter, so no SQL escaping needed
     scriptid: SCRIPT_ID,
     uniqueKey,
   };
 }
 
-function generateInsertSQL(record: ReturnType<typeof generateTestRecord>, tableName: string): string {
-  return `INSERT INTO ${tableName} (id, uid, ingested_at, data, scriptid, unique_key,impilo_uid)
-VALUES (
-    ${record.id},
-    '${record.uid}',
-    '${record.ingestedAt}',
-    '${record.data}'::jsonb,
-    '${record.scriptid}',
-    '${record.uniqueKey}',
-    '${record.impiloUid}'
-);`;
+// A plain, unquoted Postgres identifier. Anything else is rejected before it reaches SQL.
+const TABLE_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+function parsePositiveInt(value: string | undefined, fallback: number, name: string): number {
+  const parsed = parseInt(value ?? String(fallback), 10);
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    throw new Error(`${name} must be a positive whole number, got "${value}"`);
+  }
+  return parsed;
 }
 
-// Main script
-const args = process.argv.slice(2);
-const count = parseInt(args[0] || '1', 10);
-const startingId = parseInt(args[1] || '497751', 10);
-const tableName = args[2] || process.env.DB_SOURCE_TABLE || 'sessions';
-
-console.log(`-- Generated test data for ${tableName} table`);
-console.log(`-- Count: ${count}, Starting ID: ${startingId}`);
-console.log(`-- Generated at: ${new Date().toISOString()}`);
-console.log('-- Usage: psql -U postgres -d neotree_nodeapi_local -f generated-inserts.sql\n');
-
-for (let i = 0; i < count; i++) {
-  const record = generateTestRecord(startingId + i);
-  const sql = generateInsertSQL(record, tableName);
-  console.log(sql);
-  console.log('');
+function dbClientConfig(): ClientConfig {
+  const caPath = process.env.DB_SSL_CA;
+  return {
+    host: process.env.DB_HOST || 'localhost',
+    port: parseInt(process.env.DB_PORT || '5432', 10),
+    database: process.env.DB_NAME || 'neotree',
+    user: process.env.DB_USER || 'postgres',
+    // Password is optional - pg falls back to ~/.pgpass
+    ...(process.env.DB_PASSWORD && { password: process.env.DB_PASSWORD }),
+    ssl:
+      process.env.DB_SSL === 'true'
+        ? { rejectUnauthorized: true, ...(caPath && { ca: readFileSync(caPath, 'utf8') }) }
+        : false,
+  };
 }
 
-console.log('-- Verify the inserts');
-console.log(`SELECT COUNT(*) as total_records FROM ${tableName};`);
-console.log(`SELECT id, uid, ingested_at, scriptid, unique_key FROM ${tableName} ORDER BY id DESC LIMIT 10;`);
+async function main(): Promise<void> {
+  const args = process.argv.slice(2);
+  const count = parsePositiveInt(args[0], 1, 'count');
+  const startingId = parsePositiveInt(args[1], 497751, 'starting-id');
+  const tableName = args[2] || process.env.DB_SOURCE_TABLE || 'sessions';
+
+  if (!TABLE_NAME_PATTERN.test(tableName)) {
+    throw new Error(
+      `Invalid table name "${tableName}": use letters, digits and underscores, not starting with a digit`
+    );
+  }
+  // Validated above and quoted as an identifier; values are passed as parameters.
+  const table = escapeIdentifier(tableName);
+
+  const client = new Client(dbClientConfig());
+  await client.connect();
+
+  try {
+    console.log(`Inserting ${count} test record(s) into ${tableName}, starting at ID ${startingId}...`);
+
+    await client.query('BEGIN');
+    for (let i = 0; i < count; i++) {
+      const record = generateTestRecord(startingId + i);
+      await client.query(
+        `INSERT INTO ${table} (id, uid, ingested_at, data, scriptid, unique_key, impilo_uid)
+         VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7)`,
+        [
+          record.id,
+          record.uid,
+          record.ingestedAt,
+          record.data,
+          record.scriptid,
+          record.uniqueKey,
+          record.impiloUid,
+        ]
+      );
+    }
+    await client.query('COMMIT');
+    console.log(`Inserted ${count} record(s).`);
+
+    const total = await client.query(`SELECT COUNT(*) AS total_records FROM ${table}`);
+    console.log(`Total records in ${tableName}: ${total.rows[0].total_records}`);
+
+    const latest = await client.query(
+      `SELECT id, uid, ingested_at, scriptid, unique_key FROM ${table} ORDER BY id DESC LIMIT 10`
+    );
+    console.table(latest.rows);
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    throw error;
+  } finally {
+    await client.end();
+  }
+}
+
+main().catch((error: unknown) => {
+  console.error(error instanceof Error ? error.message : error);
+  process.exit(1);
+});
