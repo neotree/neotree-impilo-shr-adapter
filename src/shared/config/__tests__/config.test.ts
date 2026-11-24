@@ -62,6 +62,22 @@ describe('loadConfig', () => {
     expect(console.error).toHaveBeenCalledWith(expect.stringContaining('openhim.baseUrl'));
   });
 
+  it('maps DB_SSL and DB_SSL_CA onto the database config', () => {
+    process.env.DB_SSL = 'true';
+    process.env.DB_SSL_CA = '/etc/ssl/db-ca.pem';
+
+    const config = loadConfig();
+
+    expect(config.database.ssl).toBe(true);
+    expect(config.database.sslCa).toBe('/etc/ssl/db-ca.pem');
+  });
+
+  it('treats an empty DB_SSL_CA as unset', () => {
+    process.env.DB_SSL_CA = '';
+
+    expect(loadConfig().database.sslCa).toBeUndefined();
+  });
+
   it('rejects a missing required value', () => {
     delete process.env.FACILITY_ID;
 
