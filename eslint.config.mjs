@@ -10,6 +10,9 @@ export default [
       'dist/**',
       'node_modules/**',
       'coverage/**',
+      // Tests are outside tsconfig.json (excluded from the build), so typed
+      // linting cannot parse them.
+      'src/**/__tests__/**',
       '*.js',
       '!eslint.config.js',
     ],

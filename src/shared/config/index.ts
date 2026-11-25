@@ -21,6 +21,8 @@ const ConfigSchema = z.object({
     user: z.string(),
     password: z.string().optional(), // Optional - uses .pgpass if not provided
     ssl: z.boolean().default(false),
+    // Path to a PEM CA file for a private/self-signed DB CA. Certificates are always verified.
+    sslCa: z.string().min(1).optional(),
     sourceTable: z.string().default('sessions'),
     watermarkStart: z.string().default('1970-01-01 00:00:00'),
   }),
@@ -34,7 +36,7 @@ const ConfigSchema = z.object({
 
   // OpenHIM Configuration
   openhim: z.object({
-    baseUrl: z.string().url(),
+    baseUrl: z.url(),
     username: z.string(),
     password: z.string(),
     channelPath: z.string(),
@@ -80,6 +82,7 @@ export function loadConfig(): Config {
       user: process.env.DB_USER || 'postgres',
       password: process.env.DB_PASSWORD, // Optional - uses .pgpass if not set
       ssl: process.env.DB_SSL === 'true',
+      sslCa: process.env.DB_SSL_CA || undefined, // empty string counts as unset
       sourceTable: process.env.DB_SOURCE_TABLE || 'sessions',
       watermarkStart: process.env.DB_WATERMARK_START || '1970-01-01 00:00:00',
     },
@@ -123,7 +126,7 @@ export function loadConfig(): Config {
     if (error instanceof z.ZodError) {
       // eslint-disable-next-line no-console
       console.error('Configuration validation failed:');
-      error.errors.forEach((err) => {
+      error.issues.forEach((err) => {
         // eslint-disable-next-line no-console
         console.error(`  - ${err.path.join('.')}: ${err.message}`);
       });

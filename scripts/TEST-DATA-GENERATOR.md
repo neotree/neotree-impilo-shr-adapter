@@ -1,6 +1,8 @@
-# Test Data Generator for push_test Table
+# Test Data Generator
 
-This script generates synthetic test data INSERT statements for the `push_test` table while maintaining the JSONB structure and keeping the script metadata consistent.
+This script inserts synthetic test sessions straight into the source table (`sessions` by default) while maintaining the JSONB structure and keeping the script metadata consistent.
+
+It connects to the database itself using the same `DB_*` settings as the adapter (from `.env`), and inserts with parameterised queries. It no longer prints SQL for you to run through `psql`.
 
 ## Features
 
@@ -12,48 +14,53 @@ This script generates synthetic test data INSERT statements for the `push_test` 
 - **Unique keys**: Generates random unique keys for each record
 - **Realistic values**: Uses realistic ranges for medical data (weight, Apgar scores, vital signs, etc.)
 
+## Database Connection
+
+The script reads these from `.env` (the same settings the adapter uses):
+
+| Variable | Default | Notes |
+|---|---|---|
+| `DB_HOST` | `localhost` | |
+| `DB_PORT` | `5432` | |
+| `DB_NAME` | `neotree` | e.g. `neotree_nodeapi_local` for a local copy |
+| `DB_USER` | `postgres` | |
+| `DB_PASSWORD` | _(unset)_ | Leave unset to use `~/.pgpass` |
+| `DB_SSL` | `false` | `true` = TLS with certificate verification |
+| `DB_SSL_CA` | _(unset)_ | CA file for a private or self-signed database certificate |
+| `DB_SOURCE_TABLE` | `sessions` | Used when no table name argument is given |
+
 ## Usage
 
-### Option 1: Using the Bash Wrapper (Recommended)
+Arguments: `[count] [starting-id] [table-name]`, all optional.
+
+- `count`: number of records to insert (default `1`)
+- `starting-id`: ID of the first record (default `497751` directly, `497753` via the wrapper)
+- `table-name`: target table (default `DB_SOURCE_TABLE`, then `sessions`). Supported tables are `sessions` and `push_test`; anything else is rejected. Each table has its own fixed SQL in `TABLE_QUERIES` in `generate-test-data.ts`, so to support another table, add an entry there.
+
+### Option 1: Using the Bash Wrapper
 
 ```bash
-# Generate 1 record starting from ID 497751 (default)
+# Insert 1 record
 ./scripts/generate-test-inserts.sh
 
-# Generate 10 records starting from ID 497751
-./scripts/generate-test-inserts.sh 10
+# Insert 10 records starting from ID 497751
+./scripts/generate-test-inserts.sh 10 497751
 
-# Generate 5 records starting from ID 500000
-./scripts/generate-test-inserts.sh 5 500000
-
-# Generate 20 records and save to custom file
-./scripts/generate-test-inserts.sh 20 497751 my-test-data.sql
+# Insert 5 records starting from ID 500000 into push_test
+./scripts/generate-test-inserts.sh 5 500000 push_test
 ```
 
 ### Option 2: Using TypeScript Directly
 
 ```bash
-# Generate 1 record (output to console)
+# Insert 1 record
 npx ts-node scripts/generate-test-data.ts
 
-# Generate 10 records starting from ID 497751
-npx ts-node scripts/generate-test-data.ts 10 497751
-
-# Save to file
-npx ts-node scripts/generate-test-data.ts 10 497751 > my-inserts.sql
+# Insert 10 records starting from ID 497751 into sessions
+npx ts-node scripts/generate-test-data.ts 10 497751 sessions
 ```
 
-## Inserting Generated Data
-
-After generating the SQL file, insert it into the database:
-
-```bash
-# Using psql
-psql -U postgres -d neotree_nodeapi_local -f scripts/generated-inserts.sql
-
-# With password from .env
-PGPASSWORD=your_password psql -U postgres -d neotree_nodeapi_local -f scripts/generated-inserts.sql
-```
+All records are inserted in one transaction: if any insert fails, none are kept.
 
 ## What Gets Randomized
 
@@ -102,16 +109,18 @@ The script generates random but realistic values for:
 
 ## Example Output
 
-```sql
-INSERT INTO push_test (id, uid, ingested_at, data, scriptid, unique_key)
-VALUES (
-    497751,
-    'CB59-8845623',
-    '2025-11-07 14:32:15.456',
-    '{"uid": "CB59-8845623", "appEnv": "PROD", ...}'::jsonb,
-    '-ZO1TK4zMvLhxTw6eKia',
-    'a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6'
-);
+After inserting, the script prints the table's total row count and the 10 newest rows:
+
+```
+Inserting 2 test record(s) into sessions, starting at ID 497751...
+Inserted 2 record(s).
+Total records in sessions: 1532
+┌─────────┬────────┬────────────────┬─────────────────────────┬────────────────────────┬────────────────────┐
+│ (index) │ id     │ uid            │ ingested_at             │ scriptid               │ unique_key         │
+├─────────┼────────┼────────────────┼─────────────────────────┼────────────────────────┼────────────────────┤
+│ 0       │ 497752 │ 'CB59-3349102' │ 2026-11-24T10:12:03.000Z │ '-ZO1TK4zMvLhxTw6eKia' │ 'f0c1...'          │
+│ 1       │ 497751 │ 'CB59-8845623' │ 2026-11-24T10:12:03.000Z │ '-ZO1TK4zMvLhxTw6eKia' │ 'a1b2...'          │
+└─────────┴────────┴────────────────┴─────────────────────────┴────────────────────────┴────────────────────┘
 ```
 
 ## Finding the Last ID
@@ -119,7 +128,7 @@ VALUES (
 To find the last ID in your database:
 
 ```sql
-SELECT MAX(id) FROM push_test;
+SELECT MAX(id) FROM sessions;
 ```
 
 Then use that number + 1 as your starting ID.
@@ -137,6 +146,12 @@ chmod +x scripts/generate-test-inserts.sh
 ```
 
 **Database connection error**
-- Check your `.env` file for correct database credentials
+- Check the `DB_*` values in your `.env` file (see [Database Connection](#database-connection))
 - Ensure PostgreSQL is running
-- Verify database name: `neotree_nodeapi_local`
+- If you use `~/.pgpass`, check it has a line matching your `DB_HOST:DB_PORT:DB_NAME:DB_USER`
+
+**Error: Unsupported table**
+- Only `sessions` and `push_test` are supported. To use another table, add it to `TABLE_QUERIES` in `scripts/generate-test-data.ts`
+
+**Error: duplicate key value violates unique constraint**
+- That ID already exists. Pick a higher `starting-id` (see [Finding the Last ID](#finding-the-last-id)). Nothing from that run was inserted.

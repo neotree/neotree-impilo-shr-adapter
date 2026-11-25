@@ -77,6 +77,10 @@ DB_PORT=5432
 DB_NAME=neotree
 DB_USER=postgres
 # DB_PASSWORD= # Leave empty if using .pgpass (recommended)
+# Use TLS whenever the database is across a network. The server certificate is
+# always verified, and DB_HOST must match a name/IP on that certificate.
+DB_SSL=false
+# DB_SSL_CA=/path/to/db-ca.pem # Only for a private or self-signed CA
 
 # Source and Facility
 SOURCE_ID=neotree-system
