@@ -35,7 +35,7 @@ Arguments: `[count] [starting-id] [table-name]`, all optional.
 
 - `count`: number of records to insert (default `1`)
 - `starting-id`: ID of the first record (default `497751` directly, `497753` via the wrapper)
-- `table-name`: target table (default `DB_SOURCE_TABLE`, then `sessions`). It must be a plain table name: letters, digits and underscores, not starting with a digit. Anything else is rejected.
+- `table-name`: target table (default `DB_SOURCE_TABLE`, then `sessions`). Supported tables are `sessions` and `push_test`; anything else is rejected. Each table has its own fixed SQL in `TABLE_QUERIES` in `generate-test-data.ts`, so to support another table, add an entry there.
 
 ### Option 1: Using the Bash Wrapper
 
@@ -150,8 +150,8 @@ chmod +x scripts/generate-test-inserts.sh
 - Ensure PostgreSQL is running
 - If you use `~/.pgpass`, check it has a line matching your `DB_HOST:DB_PORT:DB_NAME:DB_USER`
 
-**Error: Invalid table name**
-- The table name must be a plain name such as `sessions` or `push_test`: letters, digits and underscores only
+**Error: Unsupported table**
+- Only `sessions` and `push_test` are supported. To use another table, add it to `TABLE_QUERIES` in `scripts/generate-test-data.ts`
 
 **Error: duplicate key value violates unique constraint**
 - That ID already exists. Pick a higher `starting-id` (see [Finding the Last ID](#finding-the-last-id)). Nothing from that run was inserted.

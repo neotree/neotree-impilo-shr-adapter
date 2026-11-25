@@ -11,7 +11,7 @@
 import { randomInt, randomBytes } from 'crypto';
 import { readFileSync } from 'fs';
 import { config as dotenvConfig } from 'dotenv';
-import { Client, ClientConfig, escapeIdentifier } from 'pg';
+import { Client, ClientConfig } from 'pg';
 
 // Load environment variables
 dotenvConfig();
@@ -289,8 +289,30 @@ function generateTestRecord(id: number) {
   };
 }
 
-// A plain, unquoted Postgres identifier. Anything else is rejected before it reaches SQL.
-const TABLE_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+interface TableQueries {
+  insert: string;
+  count: string;
+  latest: string;
+}
+
+// Each supported table has its own fixed SQL, so no table name is ever built into a query.
+// Values are always passed as parameters. To support another table, add an entry here.
+const TABLE_QUERIES: Readonly<Record<string, TableQueries>> = {
+  sessions: {
+    insert:
+      'INSERT INTO sessions (id, uid, ingested_at, data, scriptid, unique_key, impilo_uid) ' +
+      'VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7)',
+    count: 'SELECT COUNT(*) AS total_records FROM sessions',
+    latest: 'SELECT id, uid, ingested_at, scriptid, unique_key FROM sessions ORDER BY id DESC LIMIT 10',
+  },
+  push_test: {
+    insert:
+      'INSERT INTO push_test (id, uid, ingested_at, data, scriptid, unique_key, impilo_uid) ' +
+      'VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7)',
+    count: 'SELECT COUNT(*) AS total_records FROM push_test',
+    latest: 'SELECT id, uid, ingested_at, scriptid, unique_key FROM push_test ORDER BY id DESC LIMIT 10',
+  },
+};
 
 function parsePositiveInt(value: string | undefined, fallback: number, name: string): number {
   const parsed = parseInt(value ?? String(fallback), 10);
@@ -322,13 +344,12 @@ async function main(): Promise<void> {
   const startingId = parsePositiveInt(args[1], 497751, 'starting-id');
   const tableName = args[2] || process.env.DB_SOURCE_TABLE || 'sessions';
 
-  if (!TABLE_NAME_PATTERN.test(tableName)) {
+  if (!Object.prototype.hasOwnProperty.call(TABLE_QUERIES, tableName)) {
     throw new Error(
-      `Invalid table name "${tableName}": use letters, digits and underscores, not starting with a digit`
+      `Unsupported table "${tableName}": use one of ${Object.keys(TABLE_QUERIES).join(', ')}`
     );
   }
-  // Validated above and quoted as an identifier; values are passed as parameters.
-  const table = escapeIdentifier(tableName);
+  const sql = TABLE_QUERIES[tableName];
 
   const client = new Client(dbClientConfig());
   await client.connect();
@@ -339,29 +360,23 @@ async function main(): Promise<void> {
     await client.query('BEGIN');
     for (let i = 0; i < count; i++) {
       const record = generateTestRecord(startingId + i);
-      await client.query(
-        `INSERT INTO ${table} (id, uid, ingested_at, data, scriptid, unique_key, impilo_uid)
-         VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7)`,
-        [
-          record.id,
-          record.uid,
-          record.ingestedAt,
-          record.data,
-          record.scriptid,
-          record.uniqueKey,
-          record.impiloUid,
-        ]
-      );
+      await client.query(sql.insert, [
+        record.id,
+        record.uid,
+        record.ingestedAt,
+        record.data,
+        record.scriptid,
+        record.uniqueKey,
+        record.impiloUid,
+      ]);
     }
     await client.query('COMMIT');
     console.log(`Inserted ${count} record(s).`);
 
-    const total = await client.query(`SELECT COUNT(*) AS total_records FROM ${table}`);
+    const total = await client.query(sql.count);
     console.log(`Total records in ${tableName}: ${total.rows[0].total_records}`);
 
-    const latest = await client.query(
-      `SELECT id, uid, ingested_at, scriptid, unique_key FROM ${table} ORDER BY id DESC LIMIT 10`
-    );
+    const latest = await client.query(sql.latest);
     console.table(latest.rows);
   } catch (error) {
     await client.query('ROLLBACK').catch(() => undefined);
